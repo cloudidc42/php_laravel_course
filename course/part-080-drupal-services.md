@@ -1,264 +1,356 @@
-# Part 080: Drupal Services, Plugins, Entity API & Config API
+# Part 080: Drupal Services, Plugin System & Entity API
 
-**ระดับ:** Advanced  
-**เวลาเรียน:** 6-7 ชั่วโมง  
-**Prerequisites:** Part 079, PHP OOP, Dependency Injection concept
+**ระดับ:** สูง (Advanced)  
+**เวลาเรียน:** 6-8 ชั่วโมง  
+**Prerequisites:** Part 079 - Drupal Module Basics
 
 ---
 
 ## เป้าหมายของ Part นี้
 
-หลังจากเรียน Part นี้จบ คุณจะสามารถ:
-1. สร้างและใช้ Services ด้วย Dependency Injection
-2. สร้าง Block Plugins และ Field Formatter Plugins
-3. ใช้ Entity API เข้าถึง entities, fields, entity queries
-4. ใช้ Config API สำหรับ configuration management
-5. สร้าง Custom Block Plugin และ Custom Field Formatter
+1. เข้าใจ Services และ Dependency Injection ใน Drupal
+2. สร้าง Custom Service Class
+3. ใช้งาน Plugin System (Block Plugins, Field Formatter)
+4. ทำงานกับ Entity API อย่างครบถ้วน
+5. จัดการ Config ผ่าน Config API
+6. Workshop: Custom Block + Thai Currency Field Formatter
 
 ---
 
 ## 1. Services & Dependency Injection
 
-### 1.1 Drupal Service Container
+### 1.1 แนวคิด Services Container
 
-Drupal ใช้ Symfony Service Container (Dependency Injection Container) เพื่อจัดการ services
+Drupal ใช้ **Symfony's DependencyInjection Component** ซึ่งเป็น Service Container ที่จัดการ object creation และ dependencies อัตโนมัติ
+
+ทำไมต้องใช้ DI?
 
 ```php
-// ดึง service โดยตรง (global access - ใช้เฉพาะใน procedural code)
-$service = \Drupal::service('service.name');
+// ❌ วิธีเก่า - สร้าง dependency เองใน class
+class MyService {
+  public function doSomething(): void {
+    $database = new Database(); // tight coupling
+    $logger   = new Logger();   // ทดสอบยาก
+    // ...
+  }
+}
 
-// ดีกว่า: Dependency Injection ใน class
-public function __construct(ServiceInterface $service) {
-  $this->service = $service;
+// ✅ วิธีใหม่ - Inject dependencies จาก container
+class MyService {
+  public function __construct(
+    private \Drupal\Core\Database\Connection $database,
+    private \Psr\Log\LoggerInterface $logger,
+  ) {}
 }
 ```
 
-### 1.2 สร้าง Service
+**ข้อดีของ DI:**
+- ทดสอบง่าย (mock dependencies ได้)
+- Code ยืดหยุ่น และ maintainable
+- Single Responsibility Principle
+
+### 1.2 ไฟล์ mymodule.services.yml
 
 ```yaml
-# mymodule.services.yml
+# web/modules/custom/mymodule/mymodule.services.yml
+
 services:
-  # Service หลัก
-  mymodule.calculator:
-    class: Drupal\mymodule\Calculator
+  # Service พื้นฐาน
+  mymodule.helper:
+    class: Drupal\mymodule\Service\MyModuleHelper
     arguments:
-      - '@config.factory'     # inject config factory
-      - '@entity_type.manager'  # inject entity type manager
-      - '@cache.default'      # inject cache
+      - '@entity_type.manager'
+      - '@config.factory'
+      - '@logger.factory'
+      - '@current_user'
 
-  # Service แบบ Singleton (default)
-  mymodule.formatter:
-    class: Drupal\mymodule\ContentFormatter
-    arguments: ['@renderer']
+  # Service ที่ไม่มี dependencies
+  mymodule.calculator:
+    class: Drupal\mymodule\Service\Calculator
 
-  # Service แบบ Lazy loading
-  mymodule.heavy_service:
-    class: Drupal\mymodule\HeavyService
-    lazy: true
-    
-  # Tagged service (สำหรับ plugin system)
-  mymodule.event_subscriber:
-    class: Drupal\mymodule\EventSubscriber\NodeSubscriber
+  # Service ที่ใช้ parent
+  mymodule.cache_helper:
+    class: Drupal\mymodule\Service\CacheHelper
+    arguments:
+      - '@cache.default'
+      - '@cache.render'
+
+  # Tagged service
+  mymodule.content_processor:
+    class: Drupal\mymodule\Service\ContentProcessor
+    arguments:
+      - '@entity_type.manager'
+      - '@database'
     tags:
       - { name: event_subscriber }
+
+  # Alias
+  mymodule:
+    alias: mymodule.helper
 ```
 
 ### 1.3 สร้าง Service Class
 
 ```php
 <?php
-// src/Calculator.php
+// web/modules/custom/mymodule/src/Service/MyModuleHelper.php
 
-namespace Drupal\mymodule;
+namespace Drupal\mymodule\Service;
 
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
-use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\Core\Logger\LoggerChannelFactoryInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\node\NodeInterface;
 
 /**
- * Calculator service.
+ * Helper service for My Module.
  */
-class Calculator {
+class MyModuleHelper {
 
   /**
-   * @var \Drupal\Core\Config\ImmutableConfig
+   * Constructor with Dependency Injection.
    */
-  protected $config;
+  public function __construct(
+    protected EntityTypeManagerInterface $entityTypeManager,
+    protected ConfigFactoryInterface $configFactory,
+    protected LoggerChannelFactoryInterface $loggerFactory,
+    protected AccountInterface $currentUser,
+  ) {}
 
   /**
-   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
+   * Get published nodes by type.
+   *
+   * @param string $type Content type machine name.
+   * @param int    $limit Maximum number of nodes.
+   *
+   * @return \Drupal\node\NodeInterface[]
    */
-  protected $entityTypeManager;
+  public function getPublishedNodes(string $type, int $limit = 10): array {
+    $storage = $this->entityTypeManager->getStorage('node');
+
+    $nids = $storage->getQuery()
+      ->condition('status', NodeInterface::PUBLISHED)
+      ->condition('type', $type)
+      ->sort('created', 'DESC')
+      ->range(0, $limit)
+      ->accessCheck(TRUE)
+      ->execute();
+
+    if (empty($nids)) {
+      return [];
+    }
+
+    return $storage->loadMultiple($nids);
+  }
 
   /**
-   * @var \Drupal\Core\Cache\CacheBackendInterface
+   * Get module configuration.
    */
-  protected $cache;
+  public function getConfig(string $key): mixed {
+    return $this->configFactory
+      ->get('mymodule.settings')
+      ->get($key);
+  }
+
+  /**
+   * Log module activity.
+   */
+  public function log(string $message, array $context = [], string $level = 'info'): void {
+    $logger = $this->loggerFactory->get('mymodule');
+    $logger->{$level}($message, $context);
+  }
+
+  /**
+   * Check if current user can access feature.
+   */
+  public function canAccessFeature(string $permission): bool {
+    return $this->currentUser->hasPermission($permission);
+  }
+
+  /**
+   * Format nodes to array for API response.
+   */
+  public function formatNodesForApi(array $nodes): array {
+    $result = [];
+
+    foreach ($nodes as $node) {
+      if (!$node instanceof NodeInterface) {
+        continue;
+      }
+
+      $item = [
+        'id'      => $node->id(),
+        'title'   => $node->label(),
+        'type'    => $node->bundle(),
+        'url'     => $node->toUrl('canonical')->toString(),
+        'created' => $node->getCreatedTime(),
+        'author'  => [
+          'uid'  => $node->getOwnerId(),
+          'name' => $node->getOwner()->getDisplayName(),
+        ],
+      ];
+
+      // เพิ่ม field values
+      if ($node->hasField('body') && !$node->get('body')->isEmpty()) {
+        $item['summary'] = $node->get('body')->summary
+          ?? mb_substr(strip_tags($node->get('body')->value), 0, 200);
+      }
+
+      if ($node->hasField('field_image') && !$node->get('field_image')->isEmpty()) {
+        $file = $node->get('field_image')->entity;
+        if ($file) {
+          $item['image'] = \Drupal::service('file_url_generator')
+            ->generateAbsoluteString($file->getFileUri());
+        }
+      }
+
+      $result[] = $item;
+    }
+
+    return $result;
+  }
+
+}
+```
+
+### 1.4 ใช้ Service ใน Controller
+
+```php
+<?php
+// web/modules/custom/mymodule/src/Controller/ApiController.php
+
+namespace Drupal\mymodule\Controller;
+
+use Drupal\Core\Controller\ControllerBase;
+use Drupal\mymodule\Service\MyModuleHelper;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\HttpFoundation\JsonResponse;
+
+/**
+ * API Controller using DI.
+ */
+class ApiController extends ControllerBase {
 
   /**
    * Constructor.
    */
   public function __construct(
-    ConfigFactoryInterface $config_factory,
-    EntityTypeManagerInterface $entity_type_manager,
-    CacheBackendInterface $cache
-  ) {
-    $this->config = $config_factory->get('mymodule.settings');
-    $this->entityTypeManager = $entity_type_manager;
-    $this->cache = $cache;
-  }
-
-  /**
-   * คำนวณ statistics สำหรับ node.
-   *
-   * @param int $nid
-   * @return array
-   */
-  public function calculateNodeStats(int $nid): array {
-    $cache_id = 'mymodule:node_stats:' . $nid;
-    
-    // ลองดึงจาก cache ก่อน
-    if ($cached = $this->cache->get($cache_id)) {
-      return $cached->data;
-    }
-    
-    // คำนวณใหม่
-    $node = $this->entityTypeManager->getStorage('node')->load($nid);
-    if (!$node) {
-      return [];
-    }
-    
-    $stats = [
-      'word_count' => $this->countWords($node),
-      'reading_time' => $this->estimateReadingTime($node),
-      'image_count' => $this->countImages($node),
-    ];
-    
-    // บันทึก cache พร้อม cache tags
-    $this->cache->set(
-      $cache_id,
-      $stats,
-      \Drupal\Core\Cache\CacheBackendInterface::CACHE_PERMANENT,
-      ['node:' . $nid]  // Invalidate เมื่อ node เปลี่ยน
-    );
-    
-    return $stats;
-  }
-
-  protected function countWords($node): int {
-    $body = $node->get('body')->value ?? '';
-    return str_word_count(strip_tags($body));
-  }
-
-  protected function estimateReadingTime($node): int {
-    $words = $this->countWords($node);
-    return max(1, ceil($words / 200));
-  }
-
-  protected function countImages($node): int {
-    $body = $node->get('body')->value ?? '';
-    preg_match_all('/<img/i', $body, $matches);
-    return count($matches[0]);
-  }
-}
-```
-
-### 1.4 Event Subscriber
-
-```php
-<?php
-// src/EventSubscriber/NodeSubscriber.php
-
-namespace Drupal\mymodule\EventSubscriber;
-
-use Symfony\Component\EventDispatcher\EventSubscriberInterface;
-use Drupal\core_event_dispatcher\Event\Entity\EntityPresaveEvent;
-use Drupal\core_event_dispatcher\HookEventDispatcherInterface;
-
-/**
- * Subscribes to node events.
- */
-class NodeSubscriber implements EventSubscriberInterface {
+    protected MyModuleHelper $helper,
+  ) {}
 
   /**
    * {@inheritdoc}
    */
-  public static function getSubscribedEvents() {
-    return [
-      HookEventDispatcherInterface::ENTITY_PRE_SAVE => 'onEntityPresave',
-    ];
+  public static function create(ContainerInterface $container): static {
+    return new static(
+      $container->get('mymodule.helper')
+    );
   }
 
   /**
-   * Called on entity pre save.
+   * Return recent articles as JSON.
    */
-  public function onEntityPresave(EntityPresaveEvent $event) {
-    $entity = $event->getEntity();
-    if ($entity->getEntityTypeId() === 'node' && $entity->bundle() === 'article') {
-      // Do something before node save
+  public function recentArticles(): JsonResponse {
+    if (!$this->helper->canAccessFeature('access content')) {
+      return new JsonResponse(['error' => 'Access denied'], 403);
     }
+
+    $nodes = $this->helper->getPublishedNodes('article', 10);
+    $data  = $this->helper->formatNodesForApi($nodes);
+
+    return new JsonResponse([
+      'status' => 'ok',
+      'count'  => count($data),
+      'items'  => $data,
+    ]);
   }
+
 }
+```
+
+### 1.5 ใช้ Service แบบ Static (ไม่แนะนำ แต่ใช้ได้ในบางกรณี)
+
+```php
+// ใช้ใน .module file หรือ static context
+$helper = \Drupal::service('mymodule.helper');
+$nodes  = $helper->getPublishedNodes('article');
+
+// Services ที่มีใน Drupal core
+\Drupal::entityTypeManager()      // entity_type.manager
+\Drupal::database()               // database
+\Drupal::config('name')           // config.factory
+\Drupal::state()                  // state
+\Drupal::currentUser()            // current_user
+\Drupal::request()                // request_stack
+\Drupal::cache()                  // cache.default
+\Drupal::logger('channel')        // logger.factory
+\Drupal::moduleHandler()          // module_handler
+\Drupal::languageManager()        // language_manager
+\Drupal::token()                  // token
+\Drupal::messenger()              // messenger
 ```
 
 ---
 
 ## 2. Plugin System
 
-### 2.1 สร้าง Block Plugin
+Plugin System คือระบบที่ให้ Drupal discover และใช้งาน plugins แบบ dynamic โดยไม่ต้องแก้ code เดิม
+
+### 2.1 ประเภท Plugins ที่สำคัญ
+
+| Plugin Type | ใช้สำหรับ | Base Class |
+|-------------|-----------|------------|
+| Block | Custom Blocks | `BlockBase` |
+| Field Formatter | แสดงผล Field | `FormatterBase` |
+| Field Widget | Form input สำหรับ Field | `WidgetBase` |
+| Action | Batch actions | `ActionBase` |
+| Condition | Access/Visibility conditions | `ConditionPluginBase` |
+| QueueWorker | Background jobs | `QueueWorkerBase` |
+
+### 2.2 Block Plugin
 
 ```php
 <?php
-// src/Plugin/Block/RelatedPostsBlock.php
+// web/modules/custom/mymodule/src/Plugin/Block/RecentPostsBlock.php
 
-namespace Drupal\related_posts\Plugin\Block;
+namespace Drupal\mymodule\Plugin\Block;
 
 use Drupal\Core\Block\BlockBase;
 use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Cache\Cache;
 use Drupal\Core\Form\FormStateInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+use Drupal\mymodule\Service\MyModuleHelper;
 use Symfony\Component\DependencyInjection\ContainerInterface;
-use Drupal\related_posts\RelatedPostsService;
-use Drupal\Core\Routing\RouteMatchInterface;
 
 /**
- * Provides a 'Related Posts' Block.
+ * Provides a 'Recent Posts' block.
  *
  * @Block(
- *   id = "related_posts_block",
- *   admin_label = @Translation("Related Posts"),
- *   category = @Translation("Content"),
+ *   id = "mymodule_recent_posts",
+ *   admin_label = @Translation("Recent Posts"),
+ *   category = @Translation("Custom"),
  * )
  */
-class RelatedPostsBlock extends BlockBase implements ContainerFactoryPluginInterface {
+class RecentPostsBlock extends BlockBase implements ContainerFactoryPluginInterface {
 
   /**
-   * The related posts service.
-   *
-   * @var \Drupal\related_posts\RelatedPostsService
+   * The helper service.
    */
-  protected $relatedPostsService;
-
-  /**
-   * The route match.
-   *
-   * @var \Drupal\Core\Routing\RouteMatchInterface
-   */
-  protected $routeMatch;
+  protected MyModuleHelper $helper;
 
   /**
    * Constructor.
    */
   public function __construct(
     array $configuration,
-    $plugin_id,
-    $plugin_definition,
-    RelatedPostsService $related_posts_service,
-    RouteMatchInterface $route_match
+    string $plugin_id,
+    mixed $plugin_definition,
+    MyModuleHelper $helper,
   ) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
-    $this->relatedPostsService = $related_posts_service;
-    $this->routeMatch = $route_match;
+    $this->helper = $helper;
   }
 
   /**
@@ -267,281 +359,278 @@ class RelatedPostsBlock extends BlockBase implements ContainerFactoryPluginInter
   public static function create(
     ContainerInterface $container,
     array $configuration,
-    $plugin_id,
-    $plugin_definition
-  ) {
+    string $plugin_id,
+    mixed $plugin_definition,
+  ): static {
     return new static(
       $configuration,
       $plugin_id,
       $plugin_definition,
-      $container->get('related_posts.service'),
-      $container->get('current_route_match')
+      $container->get('mymodule.helper')
     );
   }
 
   /**
-   * {@inheritdoc}
    * Block configuration form.
    */
-  public function blockForm($form, FormStateInterface $form_state) {
+  public function blockForm(array $form, FormStateInterface $form_state): array {
     $form = parent::blockForm($form, $form_state);
-    
+
     $config = $this->getConfiguration();
-    
-    $form['max_posts'] = [
-      '#type' => 'number',
-      '#title' => $this->t('จำนวน posts สูงสุด'),
-      '#default_value' => $config['max_posts'] ?? 4,
-      '#min' => 1,
-      '#max' => 12,
+
+    $form['count'] = [
+      '#type'          => 'number',
+      '#title'         => $this->t('Number of posts'),
+      '#default_value' => $config['count'] ?? 5,
+      '#min'           => 1,
+      '#max'           => 20,
     ];
-    
+
+    $form['content_type'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Content Type'),
+      '#options'       => $this->getContentTypeOptions(),
+      '#default_value' => $config['content_type'] ?? 'article',
+    ];
+
     $form['show_image'] = [
-      '#type' => 'checkbox',
-      '#title' => $this->t('แสดงรูปภาพ'),
+      '#type'          => 'checkbox',
+      '#title'         => $this->t('Show featured image'),
       '#default_value' => $config['show_image'] ?? TRUE,
     ];
-    
-    $form['title_override'] = [
-      '#type' => 'textfield',
-      '#title' => $this->t('Block title override'),
-      '#default_value' => $config['title_override'] ?? 'บทความที่เกี่ยวข้อง',
-    ];
-    
+
     return $form;
   }
 
   /**
-   * {@inheritdoc}
+   * Save block configuration.
    */
-  public function blockSubmit($form, FormStateInterface $form_state) {
+  public function blockSubmit(array $form, FormStateInterface $form_state): void {
     parent::blockSubmit($form, $form_state);
-    $this->configuration['max_posts'] = $form_state->getValue('max_posts');
-    $this->configuration['show_image'] = $form_state->getValue('show_image');
-    $this->configuration['title_override'] = $form_state->getValue('title_override');
+
+    $this->configuration['count']        = $form_state->getValue('count');
+    $this->configuration['content_type'] = $form_state->getValue('content_type');
+    $this->configuration['show_image']   = $form_state->getValue('show_image');
+  }
+
+  /**
+   * Build the block.
+   */
+  public function build(): array {
+    $config       = $this->getConfiguration();
+    $count        = $config['count'] ?? 5;
+    $content_type = $config['content_type'] ?? 'article';
+    $show_image   = $config['show_image'] ?? TRUE;
+
+    $nodes = $this->helper->getPublishedNodes($content_type, $count);
+
+    if (empty($nodes)) {
+      return [
+        '#markup' => $this->t('No posts found.'),
+      ];
+    }
+
+    $items = [];
+    foreach ($nodes as $node) {
+      $item = [
+        'title' => $node->label(),
+        'url'   => $node->toUrl('canonical'),
+        'date'  => \Drupal::service('date.formatter')
+          ->format($node->getCreatedTime(), 'medium'),
+      ];
+
+      if ($show_image && $node->hasField('field_image') && !$node->get('field_image')->isEmpty()) {
+        $item['image'] = $node->get('field_image')->entity;
+      }
+
+      $items[] = $item;
+    }
+
+    return [
+      '#theme'     => 'mymodule_recent_posts_block',
+      '#items'     => $items,
+      '#cache'     => [
+        'tags'    => ['node_list'],
+        'contexts' => ['languages'],
+        'max-age'  => 3600,
+      ],
+    ];
   }
 
   /**
    * {@inheritdoc}
    */
-  public function build() {
-    // ดึง current node จาก route
-    $node = $this->routeMatch->getParameter('node');
-    
-    if (!$node) {
-      return [];
-    }
-    
-    $config = $this->getConfiguration();
-    $max_posts = $config['max_posts'] ?? 4;
-    
-    $related_posts = $this->relatedPostsService->getRelatedPosts($node->id(), $max_posts);
-    
-    if (empty($related_posts)) {
-      return [];
-    }
-    
-    // สร้าง render array
-    $items = [];
-    foreach ($related_posts as $related_node) {
-      $items[] = [
-        '#theme' => 'related_posts_item',
-        '#node' => $related_node,
-        '#show_image' => $config['show_image'] ?? TRUE,
-        '#url' => $related_node->toUrl()->toString(),
-      ];
-    }
-    
-    $build = [
-      '#theme' => 'related_posts_block',
-      '#nodes' => $related_posts,
-      '#items' => $items,
-      '#title' => $config['title_override'] ?? 'บทความที่เกี่ยวข้อง',
-      // Cache settings
-      '#cache' => [
-        'tags' => array_merge(
-          ['node:' . $node->id()],
-          array_map(fn($n) => 'node:' . $n->id(), $related_posts)
-        ),
-        'contexts' => ['route'],
-        'max-age' => 3600,
-      ],
-    ];
-    
-    return $build;
+  public function getCacheTags(): array {
+    return Cache::mergeTags(parent::getCacheTags(), ['node_list']);
   }
+
+  /**
+   * Get content type select options.
+   */
+  private function getContentTypeOptions(): array {
+    $options = [];
+    $types   = \Drupal::entityTypeManager()->getStorage('node_type')->loadMultiple();
+    foreach ($types as $type) {
+      $options[$type->id()] = $type->label();
+    }
+    return $options;
+  }
+
 }
 ```
 
-### 2.2 สร้าง Field Formatter Plugin
+### 2.3 Field Formatter Plugin
 
 ```php
 <?php
-// src/Plugin/Field/FieldFormatter/ReadTimeFormatter.php
+// web/modules/custom/mymodule/src/Plugin/Field/FieldFormatter/ThaiCurrencyFormatter.php
 
-namespace Drupal\related_posts\Plugin\Field\FieldFormatter;
+namespace Drupal\mymodule\Plugin\Field\FieldFormatter;
 
-use Drupal\Core\Field\FormatterBase;
 use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\FormatterBase;
 use Drupal\Core\Form\FormStateInterface;
 
 /**
- * Plugin implementation of the 'read_time' formatter.
+ * Plugin implementation of the Thai Currency field formatter.
  *
  * @FieldFormatter(
- *   id = "read_time_formatter",
- *   label = @Translation("Read Time"),
+ *   id = "mymodule_thai_currency",
+ *   label = @Translation("Thai Currency (฿)"),
  *   field_types = {
- *     "text",
- *     "text_long",
- *     "text_with_summary",
+ *     "decimal",
+ *     "float",
+ *     "integer",
  *   }
  * )
  */
-class ReadTimeFormatter extends FormatterBase {
+class ThaiCurrencyFormatter extends FormatterBase {
 
   /**
    * {@inheritdoc}
    */
-  public static function defaultSettings() {
+  public static function defaultSettings(): array {
     return [
-      'words_per_minute' => 200,
-      'show_icon' => TRUE,
-      'format' => 'minutes',
+      'prefix'          => '฿',
+      'suffix'          => '',
+      'decimal_places'  => 2,
+      'thousand_sep'    => ',',
+      'show_symbol'     => TRUE,
+      'color_negative'  => TRUE,
     ] + parent::defaultSettings();
   }
 
   /**
-   * {@inheritdoc}
+   * Settings form.
    */
-  public function settingsForm(array $form, FormStateInterface $form_state) {
-    $form = parent::settingsForm($form, $form_state);
-    
-    $form['words_per_minute'] = [
-      '#type' => 'number',
-      '#title' => $this->t('ความเร็วการอ่าน (words/minute)'),
-      '#default_value' => $this->getSetting('words_per_minute'),
-      '#min' => 100,
-      '#max' => 500,
+  public function settingsForm(array $form, FormStateInterface $form_state): array {
+    $elements = parent::settingsForm($form, $form_state);
+
+    $elements['prefix'] = [
+      '#type'          => 'textfield',
+      '#title'         => $this->t('Prefix'),
+      '#default_value' => $this->getSetting('prefix'),
+      '#size'          => 10,
     ];
-    
-    $form['show_icon'] = [
-      '#type' => 'checkbox',
-      '#title' => $this->t('แสดง icon นาฬิกา'),
-      '#default_value' => $this->getSetting('show_icon'),
+
+    $elements['suffix'] = [
+      '#type'          => 'textfield',
+      '#title'         => $this->t('Suffix (optional)'),
+      '#default_value' => $this->getSetting('suffix'),
+      '#size'          => 10,
     ];
-    
-    $form['format'] = [
-      '#type' => 'select',
-      '#title' => $this->t('รูปแบบ'),
-      '#options' => [
-        'minutes' => $this->t('X นาที'),
-        'minutes_seconds' => $this->t('X นาที Y วินาที'),
-        'verbose' => $this->t('ใช้เวลาอ่านประมาณ X นาที'),
+
+    $elements['decimal_places'] = [
+      '#type'          => 'number',
+      '#title'         => $this->t('Decimal Places'),
+      '#default_value' => $this->getSetting('decimal_places'),
+      '#min'           => 0,
+      '#max'           => 4,
+    ];
+
+    $elements['thousand_sep'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Thousands Separator'),
+      '#options'       => [
+        ','  => $this->t('Comma (1,000)'),
+        '.'  => $this->t('Dot (1.000)'),
+        ' '  => $this->t('Space (1 000)'),
+        ''   => $this->t('None (1000)'),
       ],
-      '#default_value' => $this->getSetting('format'),
+      '#default_value' => $this->getSetting('thousand_sep'),
     ];
-    
-    return $form;
+
+    $elements['color_negative'] = [
+      '#type'          => 'checkbox',
+      '#title'         => $this->t('Highlight negative values in red'),
+      '#default_value' => $this->getSetting('color_negative'),
+    ];
+
+    return $elements;
   }
 
   /**
-   * {@inheritdoc}
+   * Settings summary.
    */
-  public function settingsSummary() {
+  public function settingsSummary(): array {
     $summary = [];
-    $summary[] = $this->t('Speed: @wpm words/min', [
-      '@wpm' => $this->getSetting('words_per_minute'),
-    ]);
+    $example = $this->formatCurrency(1234567.89);
+    $summary[] = $this->t('Example: @example', ['@example' => $example]);
     return $summary;
   }
 
   /**
    * {@inheritdoc}
    */
-  public function viewElements(FieldItemListInterface $items, $langcode) {
+  public function viewElements(FieldItemListInterface $items, string $langcode): array {
     $elements = [];
-    $wpm = $this->getSetting('words_per_minute');
-    $format = $this->getSetting('format');
-    $show_icon = $this->getSetting('show_icon');
-    
+
     foreach ($items as $delta => $item) {
-      $text = strip_tags($item->value);
-      $word_count = str_word_count($text);
-      $seconds = round($word_count / $wpm * 60);
-      $minutes = floor($seconds / 60);
-      $remaining_seconds = $seconds % 60;
-      
-      $display_time = match($format) {
-        'minutes' => max(1, $minutes) . ' นาที',
-        'minutes_seconds' => $minutes . ' นาที ' . $remaining_seconds . ' วินาที',
-        'verbose' => 'ใช้เวลาอ่านประมาณ ' . max(1, $minutes) . ' นาที',
-      };
-      
+      $value    = (float) $item->value;
+      $formatted = $this->formatCurrency($value);
+      $negative  = $value < 0;
+
       $elements[$delta] = [
-        '#markup' => ($show_icon ? '⏱ ' : '') . $display_time,
-        '#cache' => ['max-age' => \Drupal\Core\Cache\Cache::PERMANENT],
+        '#markup' => $this->buildMarkup($formatted, $negative),
       ];
     }
-    
+
     return $elements;
   }
-}
-```
-
-### 2.3 Field Widget Plugin
-
-```php
-<?php
-// src/Plugin/Field/FieldWidget/StarRatingWidget.php
-
-namespace Drupal\mymodule\Plugin\Field\FieldWidget;
-
-use Drupal\Core\Field\FieldItemListInterface;
-use Drupal\Core\Field\WidgetBase;
-use Drupal\Core\Form\FormStateInterface;
-
-/**
- * Plugin implementation of the 'star_rating' widget.
- *
- * @FieldWidget(
- *   id = "star_rating_widget",
- *   label = @Translation("Star Rating"),
- *   field_types = {
- *     "integer",
- *     "decimal",
- *   }
- * )
- */
-class StarRatingWidget extends WidgetBase {
 
   /**
-   * {@inheritdoc}
+   * Format a number as Thai currency.
    */
-  public function formElement(
-    FieldItemListInterface $items,
-    $delta,
-    array $element,
-    array &$form,
-    FormStateInterface $form_state
-  ) {
-    $value = $items[$delta]->value ?? 0;
-    
-    $element['value'] = $element + [
-      '#type' => 'radios',
-      '#options' => [
-        1 => '⭐',
-        2 => '⭐⭐',
-        3 => '⭐⭐⭐',
-        4 => '⭐⭐⭐⭐',
-        5 => '⭐⭐⭐⭐⭐',
-      ],
-      '#default_value' => $value,
-      '#attributes' => ['class' => ['star-rating-widget']],
-    ];
-    
-    return $element;
+  protected function formatCurrency(float $value): string {
+    $prefix        = $this->getSetting('prefix');
+    $suffix        = $this->getSetting('suffix');
+    $decimals      = (int) $this->getSetting('decimal_places');
+    $thousands_sep = $this->getSetting('thousand_sep');
+    $dec_point     = $thousands_sep === '.' ? ',' : '.';
+
+    $formatted = number_format(abs($value), $decimals, $dec_point, $thousands_sep);
+    $sign      = $value < 0 ? '-' : '';
+
+    return $sign . $prefix . $formatted . $suffix;
   }
+
+  /**
+   * Build HTML markup for the formatted value.
+   */
+  protected function buildMarkup(string $formatted, bool $negative): string {
+    $color_negative = $this->getSetting('color_negative');
+
+    if ($negative && $color_negative) {
+      return '<span class="currency-negative" style="color: #e74c3c;">'
+        . htmlspecialchars($formatted, ENT_QUOTES, 'UTF-8')
+        . '</span>';
+    }
+
+    return '<span class="currency-value">'
+      . htmlspecialchars($formatted, ENT_QUOTES, 'UTF-8')
+      . '</span>';
+  }
+
 }
 ```
 
@@ -549,224 +638,233 @@ class StarRatingWidget extends WidgetBase {
 
 ## 3. Entity API
 
-### 3.1 โหลด Entities
+### 3.1 entityTypeManager
+
+`entityTypeManager` เป็น Service หลักในการทำงานกับ Entities:
 
 ```php
-<?php
+// ใน Controller หรือ Service
+$entity_type_manager = $this->entityTypeManager();
+// หรือ inject ผ่าน constructor:
+// $container->get('entity_type.manager')
 
-use Drupal\node\Entity\Node;
-use Drupal\user\Entity\User;
-use Drupal\taxonomy\Entity\Term;
+// ดึง Storage handler
+$node_storage = $entity_type_manager->getStorage('node');
+$user_storage = $entity_type_manager->getStorage('user');
+$term_storage = $entity_type_manager->getStorage('taxonomy_term');
+$file_storage = $entity_type_manager->getStorage('file');
 
-// โหลด node เดี่ยว
-$node = Node::load(1);
-// หรือ
-$node = \Drupal::entityTypeManager()->getStorage('node')->load(1);
+// ดึง View Builder
+$view_builder = $entity_type_manager->getViewBuilder('node');
+$rendered = $view_builder->view($node, 'teaser');
 
-// โหลดหลาย nodes
-$nodes = Node::loadMultiple([1, 2, 3]);
-
-// โหลด user
-$user = User::load(\Drupal::currentUser()->id());
-
-// โหลด taxonomy term
-$term = Term::load(5);
+// ดึง Entity Definition
+$definition = $entity_type_manager->getDefinition('node');
 ```
 
-### 3.2 อ่านค่า Fields
+### 3.2 Entity Query
 
 ```php
-// ดึงค่า text field
-$title = $node->getTitle();
-$body = $node->get('body')->value;
-$summary = $node->get('body')->summary;
-$format = $node->get('body')->format;
+// entityQuery - ค้นหา entity IDs
 
-// ดึงค่า integer/decimal field
-$price = $node->get('field_price')->value;
-
-// ดึงค่า boolean field
-$is_featured = (bool) $node->get('field_is_featured')->value;
-
-// ดึงค่า image field
-$image_field = $node->get('field_featured_image');
-if (!$image_field->isEmpty()) {
-  $file = $image_field->entity;  // File entity
-  $uri = $file->getFileUri();     // 'public://image.jpg'
-  $url = \Drupal::service('file_url_generator')->generateAbsoluteString($uri);
-  $alt = $image_field->alt;
-  $title = $image_field->title;
-  $width = $image_field->width;
-  $height = $image_field->height;
-}
-
-// ดึงค่า entity reference field
-$author = $node->get('uid')->entity;  // User entity
-$author_name = $author->getDisplayName();
-
-// ดึงค่า taxonomy term reference
-$categories = $node->get('field_category');
-foreach ($categories as $category_ref) {
-  $term = $category_ref->entity;
-  echo $term->getName();
-}
-
-// ดึง multiple values (unlimited cardinality)
-$tags = $node->get('field_tags');
-$tag_ids = array_column($tags->getValue(), 'target_id');
-$tag_terms = Term::loadMultiple($tag_ids);
-
-// ดึงค่า link field
-$link = $node->get('field_website');
-$url = $link->uri;
-$link_title = $link->title;
-```
-
-### 3.3 แก้ไขและบันทึก Entity
-
-```php
-// แก้ไข field values
-$node->set('title', 'New Title');
-$node->set('body', [
-  'value' => '<p>New body content</p>',
-  'format' => 'full_html',
-]);
-$node->set('field_price', 299.99);
-
-// เพิ่ม taxonomy term
-$term = Term::load(5);
-$node->get('field_tags')->appendItem(['target_id' => $term->id()]);
-
-// บันทึก node (auto creates new revision ถ้าตั้งค่าไว้)
-$node->save();
-
-// สร้าง node ใหม่
-$new_node = Node::create([
-  'type' => 'article',
-  'title' => 'New Article',
-  'body' => [
-    'value' => '<p>Content</p>',
-    'format' => 'full_html',
-  ],
-  'uid' => \Drupal::currentUser()->id(),
-  'status' => 1,
-  'field_category' => ['target_id' => 5],
-]);
-$new_node->save();
-
-// ลบ node
-$node->delete();
-```
-
-### 3.4 Entity Queries
-
-```php
-// Basic query
-$query = \Drupal::entityQuery('node');
-$nids = $query
-  ->condition('type', 'article')
+// แบบ basic
+$query = $entity_type_manager->getStorage('node')->getQuery();
+$nids  = $query
   ->condition('status', 1)
-  ->accessCheck(TRUE)
+  ->condition('type', 'article')
   ->sort('created', 'DESC')
   ->range(0, 10)
-  ->execute();
-
-// Query with multiple conditions (AND)
-$nids = \Drupal::entityQuery('node')
-  ->condition('type', 'article')
-  ->condition('status', 1)
-  ->condition('field_category.entity.name', 'Technology')
-  ->condition('created', strtotime('-30 days'), '>')
-  ->accessCheck(TRUE)
-  ->count()
-  ->execute();  // returns count
-
-// Query with OR conditions
-$nids = \Drupal::entityQuery('node')
-  ->condition('type', 'article')
-  ->condition(
-    \Drupal::entityQuery('node')
-      ->orConditionGroup()
-      ->condition('title', '%drupal%', 'LIKE')
-      ->condition('title', '%php%', 'LIKE')
-  )
   ->accessCheck(TRUE)
   ->execute();
 
-// Query taxonomy terms
-$tids = \Drupal::entityQuery('taxonomy_term')
-  ->condition('vid', 'news_category')
+// ค้นหาด้วย field
+$nids = $entity_type_manager->getStorage('node')->getQuery()
   ->condition('status', 1)
-  ->sort('weight')
-  ->accessCheck(FALSE)
-  ->execute();
-
-// Complex query: articles ที่มี specific tag
-$nids = \Drupal::entityQuery('node')
   ->condition('type', 'article')
+  ->condition('field_category', 'technology')
   ->condition('field_tags.entity.name', 'PHP')
+  ->sort('title', 'ASC')
+  ->range(0, 20)
   ->accessCheck(TRUE)
   ->execute();
 
-$nodes = \Drupal\node\Entity\Node::loadMultiple($nids);
+// ค้นหาแบบ OR
+$query   = $entity_type_manager->getStorage('node')->getQuery();
+$or_group = $query->orConditionGroup()
+  ->condition('title', '%laravel%', 'LIKE')
+  ->condition('body', '%laravel%', 'LIKE');
+
+$nids = $query
+  ->condition('status', 1)
+  ->condition($or_group)
+  ->sort('created', 'DESC')
+  ->range(0, 10)
+  ->accessCheck(TRUE)
+  ->execute();
+
+// นับ entities
+$count = $entity_type_manager->getStorage('node')->getQuery()
+  ->condition('status', 1)
+  ->condition('type', 'article')
+  ->count()
+  ->execute();
+
+// ค้นหา user
+$uids = $entity_type_manager->getStorage('user')->getQuery()
+  ->condition('status', 1)
+  ->condition('roles', 'editor', 'IN')
+  ->sort('created', 'DESC')
+  ->execute();
 ```
 
-### 3.5 Direct Database Queries (เมื่อ Entity Query ไม่เพียงพอ)
+### 3.3 Load และ loadMultiple
 
 ```php
-// ใช้ database layer โดยตรง
-$database = \Drupal::database();
-
-// Simple SELECT
-$result = $database->query(
-  "SELECT nid, title FROM {node_field_data} WHERE type = :type AND status = 1",
-  [':type' => 'article']
-)->fetchAll();
-
-// Query builder
-$query = $database->select('node_field_data', 'n');
-$query->join('node__field_category', 'c', 'n.nid = c.entity_id');
-$query->join('taxonomy_term_field_data', 't', 'c.field_category_target_id = t.tid');
-$query->fields('n', ['nid', 'title', 'created']);
-$query->fields('t', ['name']);
-$query->condition('n.type', 'article');
-$query->condition('n.status', 1);
-$query->orderBy('n.created', 'DESC');
-$query->range(0, 10);
-
-$results = $query->execute()->fetchAll();
-
-// INSERT
-$database->insert('related_posts_manual')
-  ->fields([
-    'source_nid' => 1,
-    'related_nid' => 5,
-    'weight' => 0,
-  ])
-  ->execute();
-
-// UPDATE
-$database->update('related_posts_manual')
-  ->fields(['weight' => 10])
-  ->condition('source_nid', 1)
-  ->condition('related_nid', 5)
-  ->execute();
-
-// DELETE
-$database->delete('related_posts_manual')
-  ->condition('source_nid', 1)
-  ->execute();
-
-// Transaction
-$transaction = $database->startTransaction();
-try {
-  $database->insert('related_posts_manual')->fields([...])->execute();
-  $database->update('node_field_data')->fields([...])->execute();
-  // หากสำเร็จ transaction จะ commit อัตโนมัติ
-} catch (\Exception $e) {
-  $transaction->rollBack();
-  throw $e;
+// โหลด node เดียว
+$node = $entity_type_manager->getStorage('node')->load(42);
+if ($node instanceof \Drupal\node\NodeInterface) {
+  echo $node->label();       // Title
+  echo $node->id();          // Node ID
+  echo $node->bundle();      // Content type
+  echo $node->getCreatedTime(); // Timestamp
+  echo $node->getOwnerId();  // UID
 }
+
+// โหลดหลาย nodes
+$nodes = $entity_type_manager->getStorage('node')->loadMultiple([1, 2, 3, 4]);
+foreach ($nodes as $nid => $node) {
+  echo $node->label();
+}
+
+// โหลด taxonomy terms
+$term = $entity_type_manager->getStorage('taxonomy_term')->load(5);
+echo $term->label();         // Term name
+echo $term->bundle();        // Vocabulary machine name
+echo $term->getDescription(); // Description
+
+// โหลด user
+$user = $entity_type_manager->getStorage('user')->load(1);
+echo $user->getDisplayName();
+echo $user->getEmail();
+foreach ($user->getRoles() as $role) {
+  echo $role;
+}
+```
+
+### 3.4 อ่านและเขียน Field Values
+
+```php
+// อ่าน field values
+$node = $entity_type_manager->getStorage('node')->load(42);
+
+// Text fields
+$title   = $node->get('title')->value;
+$body    = $node->get('body')->value;
+$summary = $node->get('body')->summary;
+$format  = $node->get('body')->format;
+
+// Number fields
+$price   = $node->get('field_price')->value;
+
+// Date fields
+$date    = $node->get('field_date')->value; // ISO format string
+
+// Boolean
+$featured = (bool) $node->get('field_featured')->value;
+
+// Entity Reference (single)
+$category_id = $node->get('field_category')->target_id;
+$category    = $node->get('field_category')->entity; // หรือ load โดยตรง
+
+// Entity Reference (multiple)
+foreach ($node->get('field_tags') as $tag_ref) {
+  $tid  = $tag_ref->target_id;
+  $term = $tag_ref->entity;
+  echo $term->label();
+}
+
+// Image field
+$image_field = $node->get('field_image');
+if (!$image_field->isEmpty()) {
+  $file     = $image_field->entity;
+  $alt      = $image_field->alt;
+  $title    = $image_field->title;
+  $uri      = $file->getFileUri(); // e.g., public://uploads/photo.jpg
+  $url      = \Drupal::service('file_url_generator')->generateString($uri);
+}
+
+// เขียน field values
+$node->set('title', 'New Title');
+$node->set('body', [
+  'value'   => '<p>Body content</p>',
+  'summary' => 'Short summary',
+  'format'  => 'basic_html',
+]);
+$node->set('field_price', 999.99);
+$node->set('field_featured', TRUE);
+
+// Set entity reference
+$node->set('field_category', 5); // term ID
+
+// Set multiple entity references
+$node->set('field_tags', [
+  ['target_id' => 1],
+  ['target_id' => 2],
+  ['target_id' => 3],
+]);
+
+// บันทึก
+$node->save();
+```
+
+### 3.5 สร้างและลบ Entity
+
+```php
+// สร้าง node ใหม่
+$node = $entity_type_manager->getStorage('node')->create([
+  'type'   => 'article',
+  'title'  => 'New Article',
+  'status' => 1,
+  'uid'    => \Drupal::currentUser()->id(),
+  'body'   => [
+    'value'  => '<p>Article body here.</p>',
+    'format' => 'basic_html',
+  ],
+  'field_tags' => [
+    ['target_id' => 1],
+  ],
+]);
+$node->save();
+$new_nid = $node->id();
+
+// สร้าง taxonomy term
+$term = $entity_type_manager->getStorage('taxonomy_term')->create([
+  'name' => 'New Term',
+  'vid'  => 'tags', // vocabulary machine name
+  'description' => [
+    'value'  => 'Term description',
+    'format' => 'plain_text',
+  ],
+]);
+$term->save();
+
+// สร้าง user
+$user = $entity_type_manager->getStorage('user')->create([
+  'name'   => 'newuser',
+  'mail'   => 'newuser@example.com',
+  'status' => 1,
+  'roles'  => ['editor'],
+]);
+$user->setPassword('SecurePassword123!');
+$user->save();
+
+// ลบ entity
+$node = $entity_type_manager->getStorage('node')->load(42);
+$node->delete();
+
+// ลบหลาย entities
+$nodes = $entity_type_manager->getStorage('node')->loadMultiple([1, 2, 3]);
+$entity_type_manager->getStorage('node')->delete($nodes);
 ```
 
 ---
@@ -776,317 +874,728 @@ try {
 ### 4.1 อ่าน Config
 
 ```php
-// อ่าน config object (immutable)
-$config = \Drupal::config('system.site');
-$site_name = $config->get('name');
-$site_mail = $config->get('mail');
-$slogan = $config->get('slogan');
+// อ่าน immutable config (read-only)
+$config = \Drupal::config('mymodule.settings');
+$items_per_page = $config->get('items_per_page'); // ค่าเดียว
+$all_settings   = $config->getRawData();           // ทุก keys
 
-// อ่าน nested values
-$front_page = \Drupal::config('system.site')->get('page.front');
+// อ่าน nested config
+$api_settings = $config->get('api');               // array
+$endpoint     = $config->get('api.endpoint');      // nested key
 
-// อ่าน config ใน class ที่ใช้ DI
+// ผ่าน injection
 use Drupal\Core\Config\ConfigFactoryInterface;
 
 class MyService {
-  public function __construct(private ConfigFactoryInterface $configFactory) {}
-  
-  public function getSettings(): array {
-    $config = $this->configFactory->get('mymodule.settings');
-    return [
-      'limit' => $config->get('limit') ?? 10,
-      'enabled' => $config->get('enabled') ?? FALSE,
-    ];
+  public function __construct(
+    protected ConfigFactoryInterface $configFactory,
+  ) {}
+
+  public function getSetting(string $key): mixed {
+    return $this->configFactory->get('mymodule.settings')->get($key);
   }
 }
 ```
 
-### 4.2 เขียน Config (Mutable)
+### 4.2 เขียน Config
 
 ```php
-// ดึง mutable config
-$config = \Drupal::service('config.factory')->getEditable('mymodule.settings');
+// ต้องใช้ mutable config (editable)
+$config = \Drupal::service('config.factory')
+  ->getEditable('mymodule.settings');
 
-// ตั้งค่า
-$config->set('limit', 20);
-$config->set('enabled', TRUE);
-$config->set('nested.key', 'value');
+$config->set('items_per_page', 20)->save();
+
+// เขียนหลาย values พร้อมกัน
+$config
+  ->set('items_per_page', 20)
+  ->set('cache_lifetime', 7200)
+  ->set('enable_feature', TRUE)
+  ->set('api.endpoint', 'https://api.example.com')
+  ->set('api.key', 'secret-key')
+  ->save();
+
+// ลบ key
+$config->clear('deprecated_setting')->save();
+
+// ลบ config ทั้งหมด
+$config->delete();
+```
+
+### 4.3 State API (สำหรับ runtime data)
+
+Config เหมาะสำหรับ settings ที่ export ได้  
+State เหมาะสำหรับข้อมูล runtime ที่ไม่ต้อง export
+
+```php
+// State API
+$state = \Drupal::state();
 
 // บันทึก
-$config->save();
-
-// หรือแบบ chain
-\Drupal::service('config.factory')
-  ->getEditable('mymodule.settings')
-  ->set('key', 'value')
-  ->save();
-```
-
-### 4.3 State API (Runtime state ไม่ sync กับ config management)
-
-```php
-// บันทึก state
-\Drupal::state()->set('mymodule.last_run', time());
-\Drupal::state()->set('mymodule.counter', 42);
-
-// อ่าน state
-$last_run = \Drupal::state()->get('mymodule.last_run', 0);
-
-// ลบ state
-\Drupal::state()->delete('mymodule.last_run');
-
-// Multiple values
-\Drupal::state()->setMultiple([
-  'mymodule.key1' => 'value1',
-  'mymodule.key2' => 'value2',
+$state->set('mymodule.last_import', time());
+$state->setMultiple([
+  'mymodule.counter'    => 0,
+  'mymodule.last_run'   => time(),
 ]);
-$values = \Drupal::state()->getMultiple(['mymodule.key1', 'mymodule.key2']);
-```
 
-### 4.4 Default Config Files
+// อ่าน
+$last_import = $state->get('mymodule.last_import');
+$counter     = $state->get('mymodule.counter', 0); // default value
 
-```yaml
-# config/install/mymodule.settings.yml
-# ไฟล์นี้จะถูก import เมื่อ module ถูก install ครั้งแรก
-
-limit: 10
-enabled: false
-title: 'Default Title'
-allowed_content_types:
-  - article
-  - page
-display:
-  show_image: true
-  show_date: true
-  view_mode: teaser
+// ลบ
+$state->delete('mymodule.counter');
+$state->deleteMultiple(['mymodule.counter', 'mymodule.last_run']);
 ```
 
 ---
 
-## Workshop: Custom Block Plugin + Custom Field Formatter
+## 5. Workshop: Custom Block + Thai Currency Formatter
 
-### เป้าหมาย
-สร้าง:
-1. **ReadingStatsBlock** - Block ที่แสดง reading statistics ของ current node
-2. **EstimatedReadTimeFormatter** - Field formatter สำหรับ body field แสดงเวลาอ่าน
+### Workshop A: Recent Posts Block พร้อม Caching
 
-### ขั้นตอนที่ 1: สร้าง Module Structure
+#### 5.1 โครงสร้างไฟล์
 
-```bash
-mkdir -p web/modules/custom/reading_stats/src/Plugin/{Block,Field/FieldFormatter}
-touch web/modules/custom/reading_stats/reading_stats.info.yml
-touch web/modules/custom/reading_stats/reading_stats.services.yml
+```
+web/modules/custom/custom_blocks/
+├── custom_blocks.info.yml
+├── custom_blocks.services.yml
+├── custom_blocks.module
+└── src/
+    ├── Plugin/
+    │   └── Block/
+    │       └── RecentPostsBlock.php
+    └── Service/
+        └── PostFetcher.php
 ```
 
-### ขั้นตอนที่ 2: reading_stats.info.yml
+#### 5.2 custom_blocks.info.yml
 
 ```yaml
-name: 'Reading Stats'
+name: Custom Blocks
 type: module
-description: 'Provides reading statistics for articles'
+description: 'Provides custom block plugins.'
 package: Custom
 core_version_requirement: ^10
 dependencies:
   - drupal:node
+  - drupal:block
 ```
 
-### ขั้นตอนที่ 3: reading_stats.services.yml
+#### 5.3 PostFetcher Service
+
+```php
+<?php
+// src/Service/PostFetcher.php
+
+namespace Drupal\custom_blocks\Service;
+
+use Drupal\Core\Cache\CacheBackendInterface;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\node\NodeInterface;
+
+/**
+ * Service to fetch posts with caching.
+ */
+class PostFetcher {
+
+  const CACHE_BIN = 'cache.default';
+  const CACHE_TTL = 3600; // 1 hour
+
+  public function __construct(
+    protected EntityTypeManagerInterface $entityTypeManager,
+    protected CacheBackendInterface $cache,
+  ) {}
+
+  /**
+   * Get recent posts with caching.
+   */
+  public function getRecentPosts(string $type, int $count): array {
+    $cid = "custom_blocks:recent_posts:{$type}:{$count}";
+
+    // ลอง get จาก cache ก่อน
+    if ($cached = $this->cache->get($cid)) {
+      return $cached->data;
+    }
+
+    // ถ้าไม่มี cache ดึงจาก database
+    $storage = $this->entityTypeManager->getStorage('node');
+
+    $nids = $storage->getQuery()
+      ->condition('status', NodeInterface::PUBLISHED)
+      ->condition('type', $type)
+      ->sort('created', 'DESC')
+      ->range(0, $count)
+      ->accessCheck(TRUE)
+      ->execute();
+
+    $nodes = $storage->loadMultiple($nids);
+
+    // บันทึกลง cache
+    $this->cache->set(
+      $cid,
+      $nodes,
+      time() + static::CACHE_TTL,
+      ['node_list', "node_type:{$type}"]
+    );
+
+    return $nodes;
+  }
+
+  /**
+   * Invalidate cache for a node type.
+   */
+  public function invalidateCache(string $type): void {
+    \Drupal::service('cache_tags.invalidator')
+      ->invalidateTags(["node_type:{$type}"]);
+  }
+
+}
+```
+
+#### 5.4 custom_blocks.services.yml
 
 ```yaml
 services:
-  reading_stats.calculator:
-    class: Drupal\reading_stats\ReadingCalculator
+  custom_blocks.post_fetcher:
+    class: Drupal\custom_blocks\Service\PostFetcher
     arguments:
-      - '@config.factory'
+      - '@entity_type.manager'
+      - '@cache.default'
 ```
 
-### ขั้นตอนที่ 4: ReadingCalculator Service
+#### 5.5 RecentPostsBlock Plugin (สมบูรณ์)
 
 ```php
 <?php
-// src/ReadingCalculator.php
+// src/Plugin/Block/RecentPostsBlock.php
 
-namespace Drupal\reading_stats;
-
-use Drupal\Core\Config\ConfigFactoryInterface;
-use Drupal\node\NodeInterface;
-
-class ReadingCalculator {
-
-  protected $wordsPerMinute;
-
-  public function __construct(ConfigFactoryInterface $config_factory) {
-    $config = $config_factory->get('reading_stats.settings');
-    $this->wordsPerMinute = $config->get('words_per_minute') ?? 200;
-  }
-
-  public function calculate(NodeInterface $node): array {
-    $body = '';
-    if ($node->hasField('body') && !$node->get('body')->isEmpty()) {
-      $body = $node->get('body')->value;
-    }
-    
-    $clean_text = strip_tags($body);
-    $word_count = str_word_count($clean_text);
-    $char_count = mb_strlen($clean_text);
-    $reading_seconds = round($word_count / $this->wordsPerMinute * 60);
-    $reading_minutes = max(1, ceil($reading_seconds / 60));
-    
-    // นับรูปภาพ
-    preg_match_all('/<img/i', $body, $img_matches);
-    $image_count = count($img_matches[0]);
-    
-    // นับ paragraphs
-    preg_match_all('/<p[^>]*>/i', $body, $p_matches);
-    $paragraph_count = max(1, count($p_matches[0]));
-    
-    return [
-      'word_count' => $word_count,
-      'char_count' => $char_count,
-      'reading_minutes' => $reading_minutes,
-      'reading_seconds' => $reading_seconds,
-      'image_count' => $image_count,
-      'paragraph_count' => $paragraph_count,
-    ];
-  }
-}
-```
-
-### ขั้นตอนที่ 5: ReadingStatsBlock
-
-```php
-<?php
-// src/Plugin/Block/ReadingStatsBlock.php
-
-namespace Drupal\reading_stats\Plugin\Block;
+namespace Drupal\custom_blocks\Plugin\Block;
 
 use Drupal\Core\Block\BlockBase;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Form\FormStateInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+use Drupal\custom_blocks\Service\PostFetcher;
 use Symfony\Component\DependencyInjection\ContainerInterface;
-use Drupal\reading_stats\ReadingCalculator;
-use Drupal\Core\Routing\RouteMatchInterface;
 
 /**
+ * Recent Posts Block.
+ *
  * @Block(
- *   id = "reading_stats_block",
- *   admin_label = @Translation("Reading Statistics"),
- *   category = @Translation("Content")
+ *   id = "custom_blocks_recent_posts",
+ *   admin_label = @Translation("Recent Posts"),
+ *   category = @Translation("Custom Blocks"),
  * )
  */
-class ReadingStatsBlock extends BlockBase implements ContainerFactoryPluginInterface {
-
-  protected $calculator;
-  protected $routeMatch;
+class RecentPostsBlock extends BlockBase implements ContainerFactoryPluginInterface {
 
   public function __construct(
-    array $configuration, $plugin_id, $plugin_definition,
-    ReadingCalculator $calculator,
-    RouteMatchInterface $route_match
+    array $configuration,
+    string $plugin_id,
+    mixed $plugin_definition,
+    protected PostFetcher $postFetcher,
   ) {
     parent::__construct($configuration, $plugin_id, $plugin_definition);
-    $this->calculator = $calculator;
-    $this->routeMatch = $route_match;
   }
 
-  public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
+  public static function create(
+    ContainerInterface $container,
+    array $configuration,
+    string $plugin_id,
+    mixed $plugin_definition,
+  ): static {
     return new static(
-      $configuration, $plugin_id, $plugin_definition,
-      $container->get('reading_stats.calculator'),
-      $container->get('current_route_match')
+      $configuration,
+      $plugin_id,
+      $plugin_definition,
+      $container->get('custom_blocks.post_fetcher')
     );
   }
 
-  public function build() {
-    $node = $this->routeMatch->getParameter('node');
-    if (!$node || $node->bundle() !== 'article') {
-      return [];
+  public function defaultConfiguration(): array {
+    return [
+      'count'        => 5,
+      'content_type' => 'article',
+      'show_date'    => TRUE,
+      'show_image'   => TRUE,
+    ];
+  }
+
+  public function blockForm(array $form, FormStateInterface $form_state): array {
+    $form = parent::blockForm($form, $form_state);
+    $config = $this->getConfiguration();
+
+    // โหลด node types
+    $types = \Drupal::entityTypeManager()->getStorage('node_type')->loadMultiple();
+    $type_options = [];
+    foreach ($types as $type) {
+      $type_options[$type->id()] = $type->label();
     }
 
-    $stats = $this->calculator->calculate($node);
+    $form['count'] = [
+      '#type'          => 'number',
+      '#title'         => $this->t('Number of items'),
+      '#default_value' => $config['count'],
+      '#min'           => 1,
+      '#max'           => 20,
+    ];
+
+    $form['content_type'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Content Type'),
+      '#options'       => $type_options,
+      '#default_value' => $config['content_type'],
+    ];
+
+    $form['show_date'] = [
+      '#type'          => 'checkbox',
+      '#title'         => $this->t('Show published date'),
+      '#default_value' => $config['show_date'],
+    ];
+
+    $form['show_image'] = [
+      '#type'          => 'checkbox',
+      '#title'         => $this->t('Show featured image'),
+      '#default_value' => $config['show_image'],
+    ];
+
+    return $form;
+  }
+
+  public function blockSubmit(array $form, FormStateInterface $form_state): void {
+    parent::blockSubmit($form, $form_state);
+    $this->configuration['count']        = $form_state->getValue('count');
+    $this->configuration['content_type'] = $form_state->getValue('content_type');
+    $this->configuration['show_date']    = $form_state->getValue('show_date');
+    $this->configuration['show_image']   = $form_state->getValue('show_image');
+  }
+
+  public function build(): array {
+    $config       = $this->getConfiguration();
+    $count        = (int) ($config['count'] ?? 5);
+    $content_type = $config['content_type'] ?? 'article';
+    $show_date    = (bool) ($config['show_date'] ?? TRUE);
+    $show_image   = (bool) ($config['show_image'] ?? TRUE);
+
+    $nodes = $this->postFetcher->getRecentPosts($content_type, $count);
+
+    if (empty($nodes)) {
+      return ['#markup' => $this->t('No posts available.')];
+    }
+
+    $date_formatter = \Drupal::service('date.formatter');
+    $file_url_gen   = \Drupal::service('file_url_generator');
+
+    $items = [];
+    foreach ($nodes as $node) {
+      $item = [
+        'nid'   => $node->id(),
+        'title' => $node->label(),
+        'url'   => $node->toUrl('canonical')->toString(),
+        'date'  => $show_date
+          ? $date_formatter->format($node->getCreatedTime(), 'custom', 'd M Y')
+          : NULL,
+      ];
+
+      if ($show_image
+          && $node->hasField('field_image')
+          && !$node->get('field_image')->isEmpty()
+          && $file = $node->get('field_image')->entity) {
+        $item['image_url'] = $file_url_gen->generateString($file->getFileUri());
+        $item['image_alt'] = $node->get('field_image')->alt ?? $node->label();
+      }
+
+      $items[] = $item;
+    }
 
     return [
-      '#theme' => 'reading_stats_block',
-      '#stats' => $stats,
-      '#cache' => [
-        'tags' => ['node:' . $node->id()],
-        'contexts' => ['route'],
+      '#theme'        => 'custom_blocks_recent_posts',
+      '#items'        => $items,
+      '#show_date'    => $show_date,
+      '#show_image'   => $show_image,
+      '#attached'     => [
+        'library' => ['custom_blocks/recent-posts'],
       ],
     ];
   }
+
+  public function getCacheTags(): array {
+    return Cache::mergeTags(parent::getCacheTags(), ['node_list']);
+  }
+
+  public function getCacheContexts(): array {
+    return Cache::mergeContexts(parent::getCacheContexts(), ['languages']);
+  }
+
 }
 ```
 
-### ขั้นตอนที่ 6: Enable และทดสอบ
+### Workshop B: Thai Currency Field Formatter (สมบูรณ์)
+
+#### 5.6 ThaiCurrencyFormatter พร้อม Options เต็ม
+
+```php
+<?php
+// src/Plugin/Field/FieldFormatter/ThaiCurrencyFormatter.php
+
+namespace Drupal\custom_blocks\Plugin\Field\FieldFormatter;
+
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\FormatterBase;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Thai Currency Formatter.
+ *
+ * @FieldFormatter(
+ *   id = "thai_currency",
+ *   label = @Translation("Thai Currency"),
+ *   field_types = {
+ *     "decimal",
+ *     "float",
+ *     "integer",
+ *     "list_float",
+ *   }
+ * )
+ */
+class ThaiCurrencyFormatter extends FormatterBase {
+
+  const BAHT_SYMBOL = '฿';
+
+  public static function defaultSettings(): array {
+    return [
+      'currency'        => 'THB',
+      'show_symbol'     => TRUE,
+      'decimal_places'  => 2,
+      'thousand_sep'    => ',',
+      'negative_format' => 'minus',  // minus, parentheses, color
+      'zero_display'    => 'value',  // value, dash, free
+    ] + parent::defaultSettings();
+  }
+
+  public function settingsForm(array $form, FormStateInterface $form_state): array {
+    $elements = parent::settingsForm($form, $form_state);
+
+    $elements['currency'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Currency'),
+      '#options'       => [
+        'THB' => $this->t('Thai Baht (฿)'),
+        'USD' => $this->t('US Dollar ($)'),
+        'EUR' => $this->t('Euro (€)'),
+        'JPY' => $this->t('Japanese Yen (¥)'),
+      ],
+      '#default_value' => $this->getSetting('currency'),
+    ];
+
+    $elements['show_symbol'] = [
+      '#type'          => 'checkbox',
+      '#title'         => $this->t('Show currency symbol'),
+      '#default_value' => $this->getSetting('show_symbol'),
+    ];
+
+    $elements['decimal_places'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Decimal Places'),
+      '#options'       => [0 => '0', 1 => '1', 2 => '2', 3 => '3'],
+      '#default_value' => $this->getSetting('decimal_places'),
+    ];
+
+    $elements['thousand_sep'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Thousands Separator'),
+      '#options'       => [
+        ','  => '1,000',
+        '.'  => '1.000',
+        ' '  => '1 000',
+        ''   => '1000',
+      ],
+      '#default_value' => $this->getSetting('thousand_sep'),
+    ];
+
+    $elements['negative_format'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Negative Value Format'),
+      '#options'       => [
+        'minus'       => '-฿1,000',
+        'parentheses' => '(฿1,000)',
+        'color'       => $this->t('Red color'),
+      ],
+      '#default_value' => $this->getSetting('negative_format'),
+    ];
+
+    $elements['zero_display'] = [
+      '#type'          => 'select',
+      '#title'         => $this->t('Zero Value Display'),
+      '#options'       => [
+        'value'  => '฿0.00',
+        'dash'   => '-',
+        'free'   => $this->t('Free'),
+      ],
+      '#default_value' => $this->getSetting('zero_display'),
+    ];
+
+    return $elements;
+  }
+
+  public function settingsSummary(): array {
+    $symbols = [
+      'THB' => '฿',
+      'USD' => '$',
+      'EUR' => '€',
+      'JPY' => '¥',
+    ];
+    $currency = $this->getSetting('currency');
+    $symbol   = $symbols[$currency] ?? '฿';
+    $example  = $this->formatValue(1234567.89);
+
+    return [$this->t('Example: @example', ['@example' => $example])];
+  }
+
+  public function viewElements(FieldItemListInterface $items, string $langcode): array {
+    $elements = [];
+
+    foreach ($items as $delta => $item) {
+      $value = (float) $item->value;
+
+      // Handle zero
+      if ($value == 0) {
+        $zero_display = $this->getSetting('zero_display');
+        $markup = match ($zero_display) {
+          'dash' => '<span class="currency-zero">-</span>',
+          'free' => '<span class="currency-free">' . $this->t('Free') . '</span>',
+          default => '<span class="currency-zero">' . htmlspecialchars($this->formatValue(0)) . '</span>',
+        };
+        $elements[$delta] = ['#markup' => $markup];
+        continue;
+      }
+
+      $formatted        = $this->formatValue($value);
+      $negative_format  = $this->getSetting('negative_format');
+      $is_negative      = $value < 0;
+
+      if ($is_negative && $negative_format === 'parentheses') {
+        $abs_formatted = $this->formatValue(abs($value));
+        $formatted     = "($abs_formatted)";
+        $elements[$delta] = [
+          '#markup' => '<span class="currency-negative currency-parentheses">'
+            . htmlspecialchars($formatted) . '</span>',
+        ];
+      }
+      elseif ($is_negative && $negative_format === 'color') {
+        $elements[$delta] = [
+          '#markup' => '<span class="currency-negative" style="color:#e74c3c;">'
+            . htmlspecialchars($formatted) . '</span>',
+        ];
+      }
+      else {
+        $class = $is_negative ? 'currency-negative' : 'currency-positive';
+        $elements[$delta] = [
+          '#markup' => '<span class="currency-value ' . $class . '">'
+            . htmlspecialchars($formatted) . '</span>',
+        ];
+      }
+    }
+
+    return $elements;
+  }
+
+  /**
+   * Format a numeric value as currency.
+   */
+  protected function formatValue(float $value): string {
+    $symbols = [
+      'THB' => '฿',
+      'USD' => '$',
+      'EUR' => '€',
+      'JPY' => '¥',
+    ];
+
+    $currency     = $this->getSetting('currency');
+    $show_symbol  = (bool) $this->getSetting('show_symbol');
+    $decimals     = (int) $this->getSetting('decimal_places');
+    $thousand_sep = $this->getSetting('thousand_sep');
+    $dec_point    = $thousand_sep === '.' ? ',' : '.';
+    $symbol       = $show_symbol ? ($symbols[$currency] ?? '฿') : '';
+    $sign         = $value < 0 ? '-' : '';
+
+    $formatted = number_format(abs($value), $decimals, $dec_point, $thousand_sep);
+
+    return $sign . $symbol . $formatted;
+  }
+
+}
+```
+
+#### 5.7 เพิ่ม block theme ใน .module
+
+```php
+<?php
+// custom_blocks.module
+
+/**
+ * Implements hook_theme().
+ */
+function custom_blocks_theme(array $existing, string $type, string $theme, string $path): array {
+  return [
+    'custom_blocks_recent_posts' => [
+      'variables' => [
+        'items'      => [],
+        'show_date'  => TRUE,
+        'show_image' => TRUE,
+      ],
+      'template'  => 'custom-blocks-recent-posts',
+    ],
+  ];
+}
+```
+
+#### 5.8 Twig Template สำหรับ Block
+
+```twig
+{# templates/custom-blocks-recent-posts.html.twig #}
+
+<div class="recent-posts-block">
+  {% for item in items %}
+    <article class="recent-post-item">
+      {% if show_image and item.image_url %}
+        <div class="recent-post-image">
+          <a href="{{ item.url }}">
+            <img src="{{ item.image_url }}"
+                 alt="{{ item.image_alt|e }}"
+                 loading="lazy"
+                 width="150"
+                 height="100">
+          </a>
+        </div>
+      {% endif %}
+
+      <div class="recent-post-content">
+        <h4 class="recent-post-title">
+          <a href="{{ item.url }}">{{ item.title }}</a>
+        </h4>
+
+        {% if show_date and item.date %}
+          <time class="recent-post-date">{{ item.date }}</time>
+        {% endif %}
+      </div>
+    </article>
+  {% else %}
+    <p class="recent-posts-empty">{{ 'No posts found.'|t }}</p>
+  {% endfor %}
+</div>
+```
+
+### 5.9 Enable Module และ Configure Block
 
 ```bash
-drush en reading_stats -y
+# Enable module
+drush en custom_blocks -y
 drush cr
 
-# เพิ่ม block ใน Block Layout
-# Admin > Structure > Block layout > Add block > Reading Statistics
+# ตรวจสอบ block plugin
+drush php-eval "
+  \$manager = \Drupal::service('plugin.manager.block');
+  \$definitions = \$manager->getDefinitions();
+  foreach (\$definitions as \$id => \$def) {
+    if (strpos(\$id, 'custom_blocks') !== false) {
+      print \$id . ': ' . \$def['admin_label'] . PHP_EOL;
+    }
+  }
+"
 ```
+
+จากนั้นเพิ่ม Block ผ่าน Admin UI:
+1. ไปที่ Structure > Block layout
+2. คลิก "Place block" ใน region ที่ต้องการ
+3. ค้นหา "Recent Posts" แล้วคลิก "Place block"
+4. กำหนด settings และ Save
 
 ---
 
 ## Quiz
 
-**ข้อ 1:** ความแตกต่างระหว่าง `\Drupal::config()` และ `\Drupal::service('config.factory')->getEditable()` คืออะไร?
-- a) ทำงานเหมือนกันทุกอย่าง
-- b) `\Drupal::config()` return immutable object (อ่านอย่างเดียว), `getEditable()` return mutable object (แก้ไขได้)
-- c) `\Drupal::config()` ช้ากว่า
-- d) `getEditable()` ใช้ได้เฉพาะในการ install module
+**ข้อ 1:** ข้อใดคือวิธีที่ถูกต้องในการ inject service เข้า Plugin (Block)?
 
-**เฉลย:** b) `\Drupal::config()` = อ่านอย่างเดียว, `getEditable()` = อ่านและเขียนได้
+A) ใช้ `\Drupal::service()` ใน `build()` method  
+B) Implement `ContainerFactoryPluginInterface` และใช้ `create()` static method ✓  
+C) ใช้ `@inject` annotation  
+D) เพิ่มในไฟล์ `mymodule.services.yml` โดยตรง  
 
----
-
-**ข้อ 2:** `ContainerFactoryPluginInterface` ใน Block plugin ใช้ทำอะไร?
-- a) ทำให้ block สามารถ export เป็น config ได้
-- b) ช่วยให้ plugin สามารถรับ dependencies ผ่าน service container (Dependency Injection)
-- c) ทำให้ block ทำงานได้เร็วขึ้น
-- d) ป้องกัน circular dependencies
-
-**เฉลย:** b) ContainerFactoryPluginInterface ช่วยให้ plugin รับ services จาก DI container ผ่าน static `create()` method
+**เฉลย:** B - Plugin ที่ต้องการ inject service ต้อง implement `ContainerFactoryPluginInterface` และ override `create()` method เพื่อดึง services จาก container
 
 ---
 
-**ข้อ 3:** Entity Query ต่างจาก Direct SQL Query อย่างไร?
-- a) Entity Query ช้ากว่าเสมอ
-- b) Entity Query จัดการ access control และ entity cache โดยอัตโนมัติ Direct SQL ข้ามสิ่งเหล่านี้
-- c) Direct SQL ใช้ได้เฉพาะ nodes เท่านั้น
-- d) Entity Query ใช้ได้กับ taxonomy terms เท่านั้น
+**ข้อ 2:** Method ใดใน Entity Query ใช้สำหรับนับจำนวน entity?
 
-**เฉลย:** b) Entity Query มี access checking, translation support, และ cache invalidation built-in
+A) `->total()`  
+B) `->count()` ✓  
+C) `->sum()`  
+D) `->aggregate()`  
 
----
-
-**ข้อ 4:** Plugin Annotation ใน Drupal คืออะไร?
-- a) Comment ธรรมดาใน PHP
-- b) PHP docblock ที่ Drupal อ่านเพื่อ register plugin metadata เช่น `@Block(id="...", label=...)`
-- c) Configuration file แยกต่างหาก
-- d) Database record ที่เก็บ plugin info
-
-**เฉลย:** b) Annotation เป็น docblock comments ที่ Drupal parse เพื่อ discover และ register plugins
+**เฉลย:** B - ใช้ `->count()->execute()` เพื่อ return จำนวน entities แทนที่จะเป็น array ของ IDs
 
 ---
 
-**ข้อ 5:** State API ต่างจาก Config API อย่างไร?
-- a) State API เร็วกว่า Config API
-- b) State API สำหรับ runtime state ที่ไม่ควร sync ระหว่าง environments (เช่น cron timestamps), Config API สำหรับ configuration ที่ sync ได้
-- c) Config API ใช้ database, State API ใช้ file system
-- d) ทั้งสองอย่างเหมือนกัน
+**ข้อ 3:** Annotation ใดใช้กำหนด `field_types` ที่ Field Formatter รองรับ?
 
-**เฉลย:** b) State = per-environment runtime data (ไม่ export/import), Config = exportable configuration (sync ระหว่าง environments ได้)
+A) `@FieldType`  
+B) `@FieldWidget`  
+C) `@FieldFormatter` ✓  
+D) `@Formatter`  
+
+**เฉลย:** C - `@FieldFormatter` annotation ใช้กำหนด metadata ของ formatter รวมถึง `field_types` ที่รองรับ
+
+---
+
+**ข้อ 4:** ความแตกต่างระหว่าง Config API และ State API คืออะไร?
+
+A) ไม่มีความแตกต่าง  
+B) Config ใช้สำหรับ settings ที่ export/deploy ได้ ส่วน State ใช้สำหรับ runtime data ที่ไม่ควร export ✓  
+C) State เร็วกว่า Config เสมอ  
+D) Config เก็บใน database ส่วน State เก็บในไฟล์  
+
+**เฉลย:** B - Config เหมาะสำหรับ settings ที่ต้องการ deploy ระหว่าง environment เช่น items_per_page ส่วน State เหมาะสำหรับ runtime data เช่น last cron run time
+
+---
+
+**ข้อ 5:** Cache tag `node_list` ใน Block plugin มีผลอย่างไร?
+
+A) Cache block ไว้ตลอดไป  
+B) Invalidate cache ของ block เมื่อมีการสร้าง แก้ไข หรือลบ node ใดๆ ✓  
+C) Cache เฉพาะ node ที่แสดงอยู่  
+D) ใช้สำหรับ cache ชนิด tag เท่านั้น  
+
+**เฉลย:** B - Cache tag `node_list` ถูก invalidate ทุกครั้งที่มีการ save หรือลบ node ทำให้ block แสดงข้อมูลใหม่เสมอ
 
 ---
 
 ## สรุป
 
-ใน Part นี้คุณได้เรียนรู้:
-- Services และ Dependency Injection ด้วย services.yml
-- Block Plugin และ Field Formatter Plugin
-- Entity API สำหรับโหลด, อ่าน, แก้ไข, บันทึก entities
-- Entity Queries สำหรับ complex database queries
-- Config API และ State API สำหรับจัดเก็บข้อมูล configuration
+ใน Part นี้เราได้เรียนรู้:
 
-**Part ถัดไป:** Part 097 - PHP Internals & Performance
+1. **Services & DI** - การสร้าง Service Class และ inject ผ่าน Constructor
+2. **mymodule.services.yml** - ลงทะเบียน Services และ dependencies
+3. **Block Plugin** - สร้าง Block ที่กำหนดค่าได้พร้อม Caching
+4. **Field Formatter Plugin** - สร้าง Formatter สำหรับ Thai Currency
+5. **Entity API** - entityQuery, load, loadMultiple, field values
+6. **Config API** - อ่านและเขียน configuration
+7. **Workshop** - สร้าง Recent Posts Block และ Currency Formatter จริง
+
+---
+
+## ลิงก์ที่เกี่ยวข้อง
+
+- [Drupal.org - Services and DI](https://www.drupal.org/docs/drupal-apis/services-and-dependency-injection)
+- [Drupal.org - Plugin API](https://www.drupal.org/docs/drupal-apis/plugin-api)
+- [Drupal.org - Entity API](https://www.drupal.org/docs/drupal-apis/entity-api)
+- [Drupal.org - Configuration API](https://www.drupal.org/docs/drupal-apis/configuration-api)
+- [Drupal.org - Block API](https://api.drupal.org/api/drupal/core!lib!Drupal!Core!Block!BlockBase.php/class/BlockBase/10)
+
+---
+
+## ไปต่อ
+
+➡️ **[Part 086: Design Patterns](part-086-design-patterns.md)**
+
+ใน Part ถัดไปเราจะเรียนรู้เกี่ยวกับ Design Patterns ที่สำคัญในการพัฒนา Software เช่น Singleton, Factory, Observer, Strategy และ Decorator Patterns พร้อมตัวอย่างการใช้งานจริงใน PHP
