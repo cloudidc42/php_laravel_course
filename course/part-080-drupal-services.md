@@ -1,783 +1,1092 @@
-# Part 080: Drupal Services, Dependency Injection, Plugin System & Entity API
+# Part 080: Drupal Services, Plugins, Entity API & Config API
 
 **ระดับ:** Advanced  
-**เวลาเรียน:** 6-8 ชั่วโมง  
-**Prerequisites:** Part 079 - Drupal Module Basics
+**เวลาเรียน:** 6-7 ชั่วโมง  
+**Prerequisites:** Part 079, PHP OOP, Dependency Injection concept
 
 ---
 
 ## เป้าหมายของ Part นี้
 
-1. เข้าใจ Drupal Service Container
-2. ใช้ Dependency Injection (DI)
-3. สร้าง Custom Services
-4. ใช้ Plugin System
-5. Entity API ขั้นสูง
-6. Event Subscribers
+หลังจากเรียน Part นี้จบ คุณจะสามารถ:
+1. สร้างและใช้ Services ด้วย Dependency Injection
+2. สร้าง Block Plugins และ Field Formatter Plugins
+3. ใช้ Entity API เข้าถึง entities, fields, entity queries
+4. ใช้ Config API สำหรับ configuration management
+5. สร้าง Custom Block Plugin และ Custom Field Formatter
 
 ---
 
-## 1. Service Container
+## 1. Services & Dependency Injection
 
-Drupal ใช้ Symfony Service Container สำหรับจัดการ Dependencies
+### 1.1 Drupal Service Container
 
-### 1.1 ใช้ Services
-
-```php
-<?php
-/**
- * วิธีเรียกใช้ Services ใน Drupal
- */
-
-// วิธีที่ 1: Static Method (ไม่แนะนำในโค้ด OOP)
-$entityTypeManager = \Drupal::entityTypeManager();
-$currentUser       = \Drupal::currentUser();
-$config            = \Drupal::config('system.site');
-$database          = \Drupal::database();
-$logger            = \Drupal::logger('my_module');
-$messenger         = \Drupal::messenger();
-$cache             = \Drupal::cache();
-
-// วิธีที่ 2: Dependency Injection (แนะนำ)
-// ใน Controller/Service/Plugin ให้รับ Services ผ่าน Constructor
-```
-
-### 1.2 Services ที่สำคัญ
+Drupal ใช้ Symfony Service Container (Dependency Injection Container) เพื่อจัดการ services
 
 ```php
-<?php
-/**
- * Services ที่ใช้บ่อยใน Drupal
- */
+// ดึง service โดยตรง (global access - ใช้เฉพาะใน procedural code)
+$service = \Drupal::service('service.name');
 
-// Entity Type Manager - จัดการ Entities
-$entityTypeManager = \Drupal::service('entity_type.manager');
-$nodes = $entityTypeManager->getStorage('node')->loadMultiple([1,2,3]);
-
-// Current User
-$currentUser = \Drupal::service('current_user');
-$uid = $currentUser->id();
-$roles = $currentUser->getRoles();
-
-// Route Match - ดู Current Route
-$routeMatch = \Drupal::service('current_route_match');
-$route_name = $routeMatch->getRouteName();
-$node = $routeMatch->getParameter('node');
-
-// Path Current
-$pathCurrent = \Drupal::service('path.current');
-$current_path = $pathCurrent->getPath();
-
-// Path Alias Manager
-$pathAliasManager = \Drupal::service('path_alias.manager');
-$alias = $pathAliasManager->getAliasByPath('/node/1');
-$path  = $pathAliasManager->getPathByAlias('/my-page');
-
-// Config Factory
-$configFactory = \Drupal::service('config.factory');
-$config = $configFactory->get('system.site');
-$name   = $config->get('name');
-
-// State (Key-Value Store สำหรับ Runtime State)
-$state = \Drupal::service('state');
-$state->set('my_module.last_run', time());
-$last_run = $state->get('my_module.last_run');
-
-// Cache
-$cache = \Drupal::service('cache.default');
-$cached = $cache->get('my_cache_key');
-if (!$cached) {
-    $data = expensive_operation();
-    $cache->set('my_cache_key', $data, time() + 3600, ['node_list']);
-} else {
-    $data = $cached->data;
+// ดีกว่า: Dependency Injection ใน class
+public function __construct(ServiceInterface $service) {
+  $this->service = $service;
 }
-
-// Language Manager
-$languageManager = \Drupal::service('language_manager');
-$current_lang = $languageManager->getCurrentLanguage()->getId();
-
-// File URL Generator
-$fileUrlGenerator = \Drupal::service('file_url_generator');
-$url = $fileUrlGenerator->generateAbsoluteString('public://images/photo.jpg');
-
-// Module Handler
-$moduleHandler = \Drupal::service('module_handler');
-$is_enabled = $moduleHandler->moduleExists('views');
-
-// Token Service
-$token = \Drupal::service('token');
-$replaced = $token->replace('[site:name] - [node:title]', ['node' => $node]);
 ```
 
----
-
-## 2. Custom Services
-
-### 2.1 services.yml
+### 1.2 สร้าง Service
 
 ```yaml
-# web/modules/custom/product_catalog/product_catalog.services.yml
-
+# mymodule.services.yml
 services:
-  # Main Product Service
-  product_catalog.product_manager:
-    class: Drupal\product_catalog\Service\ProductManager
+  # Service หลัก
+  mymodule.calculator:
+    class: Drupal\mymodule\Calculator
     arguments:
-      - '@entity_type.manager'
-      - '@database'
-      - '@cache.default'
-      - '@logger.factory'
-    tags:
-      - { name: service_collector }
+      - '@config.factory'     # inject config factory
+      - '@entity_type.manager'  # inject entity type manager
+      - '@cache.default'      # inject cache
 
-  # Price Calculator Service
-  product_catalog.price_calculator:
-    class: Drupal\product_catalog\Service\PriceCalculator
-    arguments:
-      - '@config.factory'
-      - '@current_user'
+  # Service แบบ Singleton (default)
+  mymodule.formatter:
+    class: Drupal\mymodule\ContentFormatter
+    arguments: ['@renderer']
 
-  # Cart Service (Shared - ไม่ต้อง Singleton ใหม่ทุกครั้ง)
-  product_catalog.cart:
-    class: Drupal\product_catalog\Service\CartService
-    arguments:
-      - '@session'
-      - '@current_user'
-      - '@entity_type.manager'
-    shared: true  # Default: สร้าง Instance เดียว
-
-  # Event Subscriber
-  product_catalog.event_subscriber:
-    class: Drupal\product_catalog\EventSubscriber\ProductEventSubscriber
-    arguments:
-      - '@logger.factory'
+  # Service แบบ Lazy loading
+  mymodule.heavy_service:
+    class: Drupal\mymodule\HeavyService
+    lazy: true
+    
+  # Tagged service (สำหรับ plugin system)
+  mymodule.event_subscriber:
+    class: Drupal\mymodule\EventSubscriber\NodeSubscriber
     tags:
       - { name: event_subscriber }
 ```
 
-### 2.2 Product Manager Service
+### 1.3 สร้าง Service Class
 
 ```php
 <?php
-/**
- * File: src/Service/ProductManager.php
- */
+// src/Calculator.php
 
-namespace Drupal\product_catalog\Service;
+namespace Drupal\mymodule;
 
-use Drupal\Core\Cache\CacheBackendInterface;
-use Drupal\Core\Database\Connection;
+use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
-use Drupal\Core\Logger\LoggerChannelFactoryInterface;
-use Drupal\Core\Logger\LoggerChannelInterface;
+use Drupal\Core\Cache\CacheBackendInterface;
 
-class ProductManager {
+/**
+ * Calculator service.
+ */
+class Calculator {
 
-    private EntityTypeManagerInterface $entityTypeManager;
-    private Connection $database;
-    private CacheBackendInterface $cache;
-    private LoggerChannelInterface $logger;
+  /**
+   * @var \Drupal\Core\Config\ImmutableConfig
+   */
+  protected $config;
 
-    public function __construct(
-        EntityTypeManagerInterface $entityTypeManager,
-        Connection $database,
-        CacheBackendInterface $cache,
-        LoggerChannelFactoryInterface $loggerFactory
-    ) {
-        $this->entityTypeManager = $entityTypeManager;
-        $this->database          = $database;
-        $this->cache             = $cache;
-        $this->logger            = $loggerFactory->get('product_catalog');
+  /**
+   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
+   */
+  protected $entityTypeManager;
+
+  /**
+   * @var \Drupal\Core\Cache\CacheBackendInterface
+   */
+  protected $cache;
+
+  /**
+   * Constructor.
+   */
+  public function __construct(
+    ConfigFactoryInterface $config_factory,
+    EntityTypeManagerInterface $entity_type_manager,
+    CacheBackendInterface $cache
+  ) {
+    $this->config = $config_factory->get('mymodule.settings');
+    $this->entityTypeManager = $entity_type_manager;
+    $this->cache = $cache;
+  }
+
+  /**
+   * คำนวณ statistics สำหรับ node.
+   *
+   * @param int $nid
+   * @return array
+   */
+  public function calculateNodeStats(int $nid): array {
+    $cache_id = 'mymodule:node_stats:' . $nid;
+    
+    // ลองดึงจาก cache ก่อน
+    if ($cached = $this->cache->get($cache_id)) {
+      return $cached->data;
     }
-
-    /**
-     * ดึง Featured Products
-     */
-    public function getFeaturedProducts(int $count = 4, ?int $category_id = NULL): array {
-        $cache_key = "product_catalog:featured:{$count}:{$category_id}";
-        $cached    = $this->cache->get($cache_key);
-
-        if ($cached) {
-            return $cached->data;
-        }
-
-        try {
-            $query = $this->entityTypeManager
-                ->getStorage('node')
-                ->getQuery()
-                ->condition('type', 'product')
-                ->condition('status', 1)
-                ->sort('created', 'DESC')
-                ->range(0, $count)
-                ->accessCheck(TRUE);
-
-            if ($category_id) {
-                $query->condition('field_product_category', $category_id);
-            }
-
-            $nids  = $query->execute();
-            $nodes = $this->entityTypeManager
-                ->getStorage('node')
-                ->loadMultiple($nids);
-
-            $products = [];
-            foreach ($nodes as $node) {
-                $products[] = $this->buildProductData($node);
-            }
-
-            $this->cache->set($cache_key, $products, time() + 3600, [
-                'node_list:product',
-                'taxonomy_term:' . $category_id,
-            ]);
-
-            return $products;
-
-        } catch (\Exception $e) {
-            $this->logger->error('Error fetching featured products: @message', [
-                '@message' => $e->getMessage(),
-            ]);
-            return [];
-        }
+    
+    // คำนวณใหม่
+    $node = $this->entityTypeManager->getStorage('node')->load($nid);
+    if (!$node) {
+      return [];
     }
+    
+    $stats = [
+      'word_count' => $this->countWords($node),
+      'reading_time' => $this->estimateReadingTime($node),
+      'image_count' => $this->countImages($node),
+    ];
+    
+    // บันทึก cache พร้อม cache tags
+    $this->cache->set(
+      $cache_id,
+      $stats,
+      \Drupal\Core\Cache\CacheBackendInterface::CACHE_PERMANENT,
+      ['node:' . $nid]  // Invalidate เมื่อ node เปลี่ยน
+    );
+    
+    return $stats;
+  }
 
-    /**
-     * ดึงสถิติ Sales
-     */
-    public function getProductStats(int $nid): array {
-        $cache_key = "product_catalog:stats:{$nid}";
-        $cached    = $this->cache->get($cache_key);
+  protected function countWords($node): int {
+    $body = $node->get('body')->value ?? '';
+    return str_word_count(strip_tags($body));
+  }
 
-        if ($cached) {
-            return $cached->data;
-        }
+  protected function estimateReadingTime($node): int {
+    $words = $this->countWords($node);
+    return max(1, ceil($words / 200));
+  }
 
-        $result = $this->database->query(
-            "SELECT COUNT(*) as total_orders, SUM(quantity) as total_sold
-             FROM {product_order_items}
-             WHERE product_id = :nid",
-            [':nid' => $nid]
-        )->fetchAssoc();
-
-        $stats = [
-            'total_orders' => (int) ($result['total_orders'] ?? 0),
-            'total_sold'   => (int) ($result['total_sold'] ?? 0),
-        ];
-
-        $this->cache->set($cache_key, $stats, time() + 300, ["node:{$nid}"]);
-
-        return $stats;
-    }
-
-    private function buildProductData(\Drupal\node\NodeInterface $node): array {
-        return [
-            'id'    => $node->id(),
-            'title' => $node->getTitle(),
-            'price' => (float) $node->get('field_price')->value,
-            'sku'   => $node->get('field_sku')->value,
-            'url'   => $node->toUrl()->toString(),
-        ];
-    }
+  protected function countImages($node): int {
+    $body = $node->get('body')->value ?? '';
+    preg_match_all('/<img/i', $body, $matches);
+    return count($matches[0]);
+  }
 }
 ```
 
-### 2.3 Inject Service ใน Controller
+### 1.4 Event Subscriber
 
 ```php
 <?php
-/**
- * Controller ที่ใช้ DI
- */
+// src/EventSubscriber/NodeSubscriber.php
 
-namespace Drupal\product_catalog\Controller;
+namespace Drupal\mymodule\EventSubscriber;
 
-use Drupal\Core\Controller\ControllerBase;
-use Drupal\product_catalog\Service\ProductManager;
-use Symfony\Component\DependencyInjection\ContainerInterface;
-
-class ProductController extends ControllerBase {
-
-    public function __construct(
-        private readonly ProductManager $productManager,
-    ) {}
-
-    public static function create(ContainerInterface $container): static {
-        return new static(
-            $container->get('product_catalog.product_manager'),
-        );
-    }
-
-    public function featured(): array {
-        $products = $this->productManager->getFeaturedProducts(8);
-
-        return [
-            '#theme'    => 'product_list',
-            '#products' => $products,
-            '#cache'    => ['tags' => ['node_list:product']],
-        ];
-    }
-}
-```
-
----
-
-## 3. Event Subscribers
-
-```php
-<?php
-/**
- * File: src/EventSubscriber/ProductEventSubscriber.php
- */
-
-namespace Drupal\product_catalog\EventSubscriber;
-
-use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
-use Symfony\Component\HttpKernel\Event\RequestEvent;
-use Symfony\Component\HttpKernel\KernelEvents;
+use Drupal\core_event_dispatcher\Event\Entity\EntityPresaveEvent;
+use Drupal\core_event_dispatcher\HookEventDispatcherInterface;
 
-class ProductEventSubscriber implements EventSubscriberInterface {
+/**
+ * Subscribes to node events.
+ */
+class NodeSubscriber implements EventSubscriberInterface {
 
-    private \Drupal\Core\Logger\LoggerChannelInterface $logger;
+  /**
+   * {@inheritdoc}
+   */
+  public static function getSubscribedEvents() {
+    return [
+      HookEventDispatcherInterface::ENTITY_PRE_SAVE => 'onEntityPresave',
+    ];
+  }
 
-    public function __construct(LoggerChannelFactoryInterface $loggerFactory) {
-        $this->logger = $loggerFactory->get('product_catalog');
+  /**
+   * Called on entity pre save.
+   */
+  public function onEntityPresave(EntityPresaveEvent $event) {
+    $entity = $event->getEntity();
+    if ($entity->getEntityTypeId() === 'node' && $entity->bundle() === 'article') {
+      // Do something before node save
     }
-
-    public static function getSubscribedEvents(): array {
-        return [
-            KernelEvents::REQUEST => [
-                ['onRequest', 100],
-            ],
-            // Drupal-specific Events
-            'entity.presave' => 'onEntityPreSave',
-        ];
-    }
-
-    public function onRequest(RequestEvent $event): void {
-        $request = $event->getRequest();
-        $path    = $request->getPathInfo();
-
-        // Log Product Page Views
-        if (str_starts_with($path, '/products/')) {
-            $this->logger->info('Product page accessed: @path', ['@path' => $path]);
-        }
-    }
-
-    public function onEntityPreSave(\Drupal\Core\Entity\EntityInterface $entity): void {
-        if ($entity->getEntityTypeId() !== 'node' || $entity->bundle() !== 'product') {
-            return;
-        }
-
-        // Log product saves
-        $this->logger->info('Product saved: @title', [
-            '@title' => $entity->label(),
-        ]);
-    }
+  }
 }
 ```
 
 ---
 
-## 4. Entity API ขั้นสูง
+## 2. Plugin System
 
-### 4.1 Custom Entity Type
+### 2.1 สร้าง Block Plugin
 
 ```php
 <?php
+// src/Plugin/Block/RelatedPostsBlock.php
+
+namespace Drupal\related_posts\Plugin\Block;
+
+use Drupal\Core\Block\BlockBase;
+use Drupal\Core\Block\BlockPluginInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\related_posts\RelatedPostsService;
+use Drupal\Core\Routing\RouteMatchInterface;
+
 /**
- * File: src/Entity/ProductReview.php
- * 
- * สร้าง Custom Entity
- */
-
-namespace Drupal\product_catalog\Entity;
-
-use Drupal\Core\Entity\ContentEntityBase;
-use Drupal\Core\Entity\EntityTypeInterface;
-use Drupal\Core\Field\BaseFieldDefinition;
-
-/**
- * @ContentEntityType(
- *   id = "product_review",
- *   label = @Translation("Product Review"),
- *   base_table = "product_review",
- *   entity_keys = {
- *     "id" = "id",
- *     "uid" = "uid",
- *     "uuid" = "uuid",
- *   },
- *   handlers = {
- *     "storage" = "Drupal\Core\Entity\Sql\SqlContentEntityStorage",
- *     "list_builder" = "Drupal\Core\Entity\EntityListBuilder",
- *     "form" = {
- *       "default" = "Drupal\Core\Entity\ContentEntityForm",
- *       "delete" = "Drupal\Core\Entity\ContentEntityDeleteForm",
- *     },
- *   },
- *   links = {
- *     "canonical" = "/product-review/{product_review}",
- *     "edit-form" = "/product-review/{product_review}/edit",
- *     "delete-form" = "/product-review/{product_review}/delete",
- *   },
+ * Provides a 'Related Posts' Block.
+ *
+ * @Block(
+ *   id = "related_posts_block",
+ *   admin_label = @Translation("Related Posts"),
+ *   category = @Translation("Content"),
  * )
  */
-class ProductReview extends ContentEntityBase {
+class RelatedPostsBlock extends BlockBase implements ContainerFactoryPluginInterface {
 
-    public static function baseFieldDefinitions(EntityTypeInterface $entity_type): array {
-        $fields = parent::baseFieldDefinitions($entity_type);
+  /**
+   * The related posts service.
+   *
+   * @var \Drupal\related_posts\RelatedPostsService
+   */
+  protected $relatedPostsService;
 
-        // Node Reference
-        $fields['nid'] = BaseFieldDefinition::create('entity_reference')
-            ->setLabel(t('Product'))
-            ->setRequired(TRUE)
-            ->setSetting('target_type', 'node')
-            ->setSetting('handler_settings', ['target_bundles' => ['product']])
-            ->setDisplayOptions('form', ['type' => 'entity_reference_autocomplete'])
-            ->setDisplayConfigurable('form', TRUE);
+  /**
+   * The route match.
+   *
+   * @var \Drupal\Core\Routing\RouteMatchInterface
+   */
+  protected $routeMatch;
 
-        // Rating
-        $fields['rating'] = BaseFieldDefinition::create('integer')
-            ->setLabel(t('Rating'))
-            ->setRequired(TRUE)
-            ->setSetting('min', 1)
-            ->setSetting('max', 5)
-            ->setDisplayOptions('view', ['type' => 'number_integer'])
-            ->setDisplayOptions('form', ['type' => 'number'])
-            ->setDisplayConfigurable('view', TRUE)
-            ->setDisplayConfigurable('form', TRUE);
+  /**
+   * Constructor.
+   */
+  public function __construct(
+    array $configuration,
+    $plugin_id,
+    $plugin_definition,
+    RelatedPostsService $related_posts_service,
+    RouteMatchInterface $route_match
+  ) {
+    parent::__construct($configuration, $plugin_id, $plugin_definition);
+    $this->relatedPostsService = $related_posts_service;
+    $this->routeMatch = $route_match;
+  }
 
-        // Review Text
-        $fields['review'] = BaseFieldDefinition::create('text_long')
-            ->setLabel(t('Review'))
-            ->setRequired(TRUE)
-            ->setDisplayOptions('view', [
-                'label' => 'above',
-                'type'  => 'text_default',
-            ])
-            ->setDisplayOptions('form', ['type' => 'text_textarea'])
-            ->setDisplayConfigurable('view', TRUE)
-            ->setDisplayConfigurable('form', TRUE);
+  /**
+   * {@inheritdoc}
+   */
+  public static function create(
+    ContainerInterface $container,
+    array $configuration,
+    $plugin_id,
+    $plugin_definition
+  ) {
+    return new static(
+      $configuration,
+      $plugin_id,
+      $plugin_definition,
+      $container->get('related_posts.service'),
+      $container->get('current_route_match')
+    );
+  }
 
-        // Author
-        $fields['uid'] = BaseFieldDefinition::create('entity_reference')
-            ->setLabel(t('Author'))
-            ->setSetting('target_type', 'user')
-            ->setDefaultValueCallback(static::class . '::getDefaultEntityOwner');
+  /**
+   * {@inheritdoc}
+   * Block configuration form.
+   */
+  public function blockForm($form, FormStateInterface $form_state) {
+    $form = parent::blockForm($form, $form_state);
+    
+    $config = $this->getConfiguration();
+    
+    $form['max_posts'] = [
+      '#type' => 'number',
+      '#title' => $this->t('จำนวน posts สูงสุด'),
+      '#default_value' => $config['max_posts'] ?? 4,
+      '#min' => 1,
+      '#max' => 12,
+    ];
+    
+    $form['show_image'] = [
+      '#type' => 'checkbox',
+      '#title' => $this->t('แสดงรูปภาพ'),
+      '#default_value' => $config['show_image'] ?? TRUE,
+    ];
+    
+    $form['title_override'] = [
+      '#type' => 'textfield',
+      '#title' => $this->t('Block title override'),
+      '#default_value' => $config['title_override'] ?? 'บทความที่เกี่ยวข้อง',
+    ];
+    
+    return $form;
+  }
 
-        // Created
-        $fields['created'] = BaseFieldDefinition::create('created')
-            ->setLabel(t('Created'));
+  /**
+   * {@inheritdoc}
+   */
+  public function blockSubmit($form, FormStateInterface $form_state) {
+    parent::blockSubmit($form, $form_state);
+    $this->configuration['max_posts'] = $form_state->getValue('max_posts');
+    $this->configuration['show_image'] = $form_state->getValue('show_image');
+    $this->configuration['title_override'] = $form_state->getValue('title_override');
+  }
 
-        // Status
-        $fields['status'] = BaseFieldDefinition::create('boolean')
-            ->setLabel(t('Published'))
-            ->setDefaultValue(FALSE);
-
-        return $fields;
+  /**
+   * {@inheritdoc}
+   */
+  public function build() {
+    // ดึง current node จาก route
+    $node = $this->routeMatch->getParameter('node');
+    
+    if (!$node) {
+      return [];
     }
-
-    public function getProduct(): ?\Drupal\node\NodeInterface {
-        return $this->get('nid')->entity;
+    
+    $config = $this->getConfiguration();
+    $max_posts = $config['max_posts'] ?? 4;
+    
+    $related_posts = $this->relatedPostsService->getRelatedPosts($node->id(), $max_posts);
+    
+    if (empty($related_posts)) {
+      return [];
     }
-
-    public function getRating(): int {
-        return (int) $this->get('rating')->value;
+    
+    // สร้าง render array
+    $items = [];
+    foreach ($related_posts as $related_node) {
+      $items[] = [
+        '#theme' => 'related_posts_item',
+        '#node' => $related_node,
+        '#show_image' => $config['show_image'] ?? TRUE,
+        '#url' => $related_node->toUrl()->toString(),
+      ];
     }
-
-    public function getReview(): string {
-        return $this->get('review')->value ?? '';
-    }
-
-    public function isApproved(): bool {
-        return (bool) $this->get('status')->value;
-    }
+    
+    $build = [
+      '#theme' => 'related_posts_block',
+      '#nodes' => $related_posts,
+      '#items' => $items,
+      '#title' => $config['title_override'] ?? 'บทความที่เกี่ยวข้อง',
+      // Cache settings
+      '#cache' => [
+        'tags' => array_merge(
+          ['node:' . $node->id()],
+          array_map(fn($n) => 'node:' . $n->id(), $related_posts)
+        ),
+        'contexts' => ['route'],
+        'max-age' => 3600,
+      ],
+    ];
+    
+    return $build;
+  }
 }
 ```
 
-### 4.2 Entity Query ขั้นสูง
+### 2.2 สร้าง Field Formatter Plugin
 
 ```php
 <?php
-/**
- * Entity Query ขั้นสูง
- */
+// src/Plugin/Field/FieldFormatter/ReadTimeFormatter.php
 
-// Query ด้วย Multiple Conditions
+namespace Drupal\related_posts\Plugin\Field\FieldFormatter;
+
+use Drupal\Core\Field\FormatterBase;
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Plugin implementation of the 'read_time' formatter.
+ *
+ * @FieldFormatter(
+ *   id = "read_time_formatter",
+ *   label = @Translation("Read Time"),
+ *   field_types = {
+ *     "text",
+ *     "text_long",
+ *     "text_with_summary",
+ *   }
+ * )
+ */
+class ReadTimeFormatter extends FormatterBase {
+
+  /**
+   * {@inheritdoc}
+   */
+  public static function defaultSettings() {
+    return [
+      'words_per_minute' => 200,
+      'show_icon' => TRUE,
+      'format' => 'minutes',
+    ] + parent::defaultSettings();
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function settingsForm(array $form, FormStateInterface $form_state) {
+    $form = parent::settingsForm($form, $form_state);
+    
+    $form['words_per_minute'] = [
+      '#type' => 'number',
+      '#title' => $this->t('ความเร็วการอ่าน (words/minute)'),
+      '#default_value' => $this->getSetting('words_per_minute'),
+      '#min' => 100,
+      '#max' => 500,
+    ];
+    
+    $form['show_icon'] = [
+      '#type' => 'checkbox',
+      '#title' => $this->t('แสดง icon นาฬิกา'),
+      '#default_value' => $this->getSetting('show_icon'),
+    ];
+    
+    $form['format'] = [
+      '#type' => 'select',
+      '#title' => $this->t('รูปแบบ'),
+      '#options' => [
+        'minutes' => $this->t('X นาที'),
+        'minutes_seconds' => $this->t('X นาที Y วินาที'),
+        'verbose' => $this->t('ใช้เวลาอ่านประมาณ X นาที'),
+      ],
+      '#default_value' => $this->getSetting('format'),
+    ];
+    
+    return $form;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function settingsSummary() {
+    $summary = [];
+    $summary[] = $this->t('Speed: @wpm words/min', [
+      '@wpm' => $this->getSetting('words_per_minute'),
+    ]);
+    return $summary;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function viewElements(FieldItemListInterface $items, $langcode) {
+    $elements = [];
+    $wpm = $this->getSetting('words_per_minute');
+    $format = $this->getSetting('format');
+    $show_icon = $this->getSetting('show_icon');
+    
+    foreach ($items as $delta => $item) {
+      $text = strip_tags($item->value);
+      $word_count = str_word_count($text);
+      $seconds = round($word_count / $wpm * 60);
+      $minutes = floor($seconds / 60);
+      $remaining_seconds = $seconds % 60;
+      
+      $display_time = match($format) {
+        'minutes' => max(1, $minutes) . ' นาที',
+        'minutes_seconds' => $minutes . ' นาที ' . $remaining_seconds . ' วินาที',
+        'verbose' => 'ใช้เวลาอ่านประมาณ ' . max(1, $minutes) . ' นาที',
+      };
+      
+      $elements[$delta] = [
+        '#markup' => ($show_icon ? '⏱ ' : '') . $display_time,
+        '#cache' => ['max-age' => \Drupal\Core\Cache\Cache::PERMANENT],
+      ];
+    }
+    
+    return $elements;
+  }
+}
+```
+
+### 2.3 Field Widget Plugin
+
+```php
+<?php
+// src/Plugin/Field/FieldWidget/StarRatingWidget.php
+
+namespace Drupal\mymodule\Plugin\Field\FieldWidget;
+
+use Drupal\Core\Field\FieldItemListInterface;
+use Drupal\Core\Field\WidgetBase;
+use Drupal\Core\Form\FormStateInterface;
+
+/**
+ * Plugin implementation of the 'star_rating' widget.
+ *
+ * @FieldWidget(
+ *   id = "star_rating_widget",
+ *   label = @Translation("Star Rating"),
+ *   field_types = {
+ *     "integer",
+ *     "decimal",
+ *   }
+ * )
+ */
+class StarRatingWidget extends WidgetBase {
+
+  /**
+   * {@inheritdoc}
+   */
+  public function formElement(
+    FieldItemListInterface $items,
+    $delta,
+    array $element,
+    array &$form,
+    FormStateInterface $form_state
+  ) {
+    $value = $items[$delta]->value ?? 0;
+    
+    $element['value'] = $element + [
+      '#type' => 'radios',
+      '#options' => [
+        1 => '⭐',
+        2 => '⭐⭐',
+        3 => '⭐⭐⭐',
+        4 => '⭐⭐⭐⭐',
+        5 => '⭐⭐⭐⭐⭐',
+      ],
+      '#default_value' => $value,
+      '#attributes' => ['class' => ['star-rating-widget']],
+    ];
+    
+    return $element;
+  }
+}
+```
+
+---
+
+## 3. Entity API
+
+### 3.1 โหลด Entities
+
+```php
+<?php
+
+use Drupal\node\Entity\Node;
+use Drupal\user\Entity\User;
+use Drupal\taxonomy\Entity\Term;
+
+// โหลด node เดี่ยว
+$node = Node::load(1);
+// หรือ
+$node = \Drupal::entityTypeManager()->getStorage('node')->load(1);
+
+// โหลดหลาย nodes
+$nodes = Node::loadMultiple([1, 2, 3]);
+
+// โหลด user
+$user = User::load(\Drupal::currentUser()->id());
+
+// โหลด taxonomy term
+$term = Term::load(5);
+```
+
+### 3.2 อ่านค่า Fields
+
+```php
+// ดึงค่า text field
+$title = $node->getTitle();
+$body = $node->get('body')->value;
+$summary = $node->get('body')->summary;
+$format = $node->get('body')->format;
+
+// ดึงค่า integer/decimal field
+$price = $node->get('field_price')->value;
+
+// ดึงค่า boolean field
+$is_featured = (bool) $node->get('field_is_featured')->value;
+
+// ดึงค่า image field
+$image_field = $node->get('field_featured_image');
+if (!$image_field->isEmpty()) {
+  $file = $image_field->entity;  // File entity
+  $uri = $file->getFileUri();     // 'public://image.jpg'
+  $url = \Drupal::service('file_url_generator')->generateAbsoluteString($uri);
+  $alt = $image_field->alt;
+  $title = $image_field->title;
+  $width = $image_field->width;
+  $height = $image_field->height;
+}
+
+// ดึงค่า entity reference field
+$author = $node->get('uid')->entity;  // User entity
+$author_name = $author->getDisplayName();
+
+// ดึงค่า taxonomy term reference
+$categories = $node->get('field_category');
+foreach ($categories as $category_ref) {
+  $term = $category_ref->entity;
+  echo $term->getName();
+}
+
+// ดึง multiple values (unlimited cardinality)
+$tags = $node->get('field_tags');
+$tag_ids = array_column($tags->getValue(), 'target_id');
+$tag_terms = Term::loadMultiple($tag_ids);
+
+// ดึงค่า link field
+$link = $node->get('field_website');
+$url = $link->uri;
+$link_title = $link->title;
+```
+
+### 3.3 แก้ไขและบันทึก Entity
+
+```php
+// แก้ไข field values
+$node->set('title', 'New Title');
+$node->set('body', [
+  'value' => '<p>New body content</p>',
+  'format' => 'full_html',
+]);
+$node->set('field_price', 299.99);
+
+// เพิ่ม taxonomy term
+$term = Term::load(5);
+$node->get('field_tags')->appendItem(['target_id' => $term->id()]);
+
+// บันทึก node (auto creates new revision ถ้าตั้งค่าไว้)
+$node->save();
+
+// สร้าง node ใหม่
+$new_node = Node::create([
+  'type' => 'article',
+  'title' => 'New Article',
+  'body' => [
+    'value' => '<p>Content</p>',
+    'format' => 'full_html',
+  ],
+  'uid' => \Drupal::currentUser()->id(),
+  'status' => 1,
+  'field_category' => ['target_id' => 5],
+]);
+$new_node->save();
+
+// ลบ node
+$node->delete();
+```
+
+### 3.4 Entity Queries
+
+```php
+// Basic query
+$query = \Drupal::entityQuery('node');
+$nids = $query
+  ->condition('type', 'article')
+  ->condition('status', 1)
+  ->accessCheck(TRUE)
+  ->sort('created', 'DESC')
+  ->range(0, 10)
+  ->execute();
+
+// Query with multiple conditions (AND)
 $nids = \Drupal::entityQuery('node')
-    ->condition('type', 'product')
-    ->condition('status', 1)
-    // Nested AND/OR
-    ->condition(
-        \Drupal::entityQuery('node')
-            ->orConditionGroup()
-            ->condition('field_price', 100, '<')
-            ->condition('title', '%sale%', 'LIKE')
-    )
-    ->sort('field_price', 'ASC')
-    ->range(0, 10)
-    ->accessCheck(TRUE)
-    ->execute();
+  ->condition('type', 'article')
+  ->condition('status', 1)
+  ->condition('field_category.entity.name', 'Technology')
+  ->condition('created', strtotime('-30 days'), '>')
+  ->accessCheck(TRUE)
+  ->count()
+  ->execute();  // returns count
 
-// Aggregate Query
-$result = \Drupal::entityQuery('node')
-    ->condition('type', 'product')
-    ->condition('status', 1)
-    ->aggregate('field_price', 'AVG')
-    ->execute();
-$avg_price = $result[0]['field_price_value_avg'] ?? 0;
+// Query with OR conditions
+$nids = \Drupal::entityQuery('node')
+  ->condition('type', 'article')
+  ->condition(
+    \Drupal::entityQuery('node')
+      ->orConditionGroup()
+      ->condition('title', '%drupal%', 'LIKE')
+      ->condition('title', '%php%', 'LIKE')
+  )
+  ->accessCheck(TRUE)
+  ->execute();
 
-// Count
-$count = \Drupal::entityQuery('node')
-    ->condition('type', 'product')
-    ->accessCheck(FALSE)
-    ->count()
-    ->execute();
+// Query taxonomy terms
+$tids = \Drupal::entityQuery('taxonomy_term')
+  ->condition('vid', 'news_category')
+  ->condition('status', 1)
+  ->sort('weight')
+  ->accessCheck(FALSE)
+  ->execute();
+
+// Complex query: articles ที่มี specific tag
+$nids = \Drupal::entityQuery('node')
+  ->condition('type', 'article')
+  ->condition('field_tags.entity.name', 'PHP')
+  ->accessCheck(TRUE)
+  ->execute();
+
+$nodes = \Drupal\node\Entity\Node::loadMultiple($nids);
+```
+
+### 3.5 Direct Database Queries (เมื่อ Entity Query ไม่เพียงพอ)
+
+```php
+// ใช้ database layer โดยตรง
+$database = \Drupal::database();
+
+// Simple SELECT
+$result = $database->query(
+  "SELECT nid, title FROM {node_field_data} WHERE type = :type AND status = 1",
+  [':type' => 'article']
+)->fetchAll();
+
+// Query builder
+$query = $database->select('node_field_data', 'n');
+$query->join('node__field_category', 'c', 'n.nid = c.entity_id');
+$query->join('taxonomy_term_field_data', 't', 'c.field_category_target_id = t.tid');
+$query->fields('n', ['nid', 'title', 'created']);
+$query->fields('t', ['name']);
+$query->condition('n.type', 'article');
+$query->condition('n.status', 1);
+$query->orderBy('n.created', 'DESC');
+$query->range(0, 10);
+
+$results = $query->execute()->fetchAll();
+
+// INSERT
+$database->insert('related_posts_manual')
+  ->fields([
+    'source_nid' => 1,
+    'related_nid' => 5,
+    'weight' => 0,
+  ])
+  ->execute();
+
+// UPDATE
+$database->update('related_posts_manual')
+  ->fields(['weight' => 10])
+  ->condition('source_nid', 1)
+  ->condition('related_nid', 5)
+  ->execute();
+
+// DELETE
+$database->delete('related_posts_manual')
+  ->condition('source_nid', 1)
+  ->execute();
+
+// Transaction
+$transaction = $database->startTransaction();
+try {
+  $database->insert('related_posts_manual')->fields([...])->execute();
+  $database->update('node_field_data')->fields([...])->execute();
+  // หากสำเร็จ transaction จะ commit อัตโนมัติ
+} catch (\Exception $e) {
+  $transaction->rollBack();
+  throw $e;
+}
 ```
 
 ---
 
-## 5. Plugin System
+## 4. Config API
+
+### 4.1 อ่าน Config
+
+```php
+// อ่าน config object (immutable)
+$config = \Drupal::config('system.site');
+$site_name = $config->get('name');
+$site_mail = $config->get('mail');
+$slogan = $config->get('slogan');
+
+// อ่าน nested values
+$front_page = \Drupal::config('system.site')->get('page.front');
+
+// อ่าน config ใน class ที่ใช้ DI
+use Drupal\Core\Config\ConfigFactoryInterface;
+
+class MyService {
+  public function __construct(private ConfigFactoryInterface $configFactory) {}
+  
+  public function getSettings(): array {
+    $config = $this->configFactory->get('mymodule.settings');
+    return [
+      'limit' => $config->get('limit') ?? 10,
+      'enabled' => $config->get('enabled') ?? FALSE,
+    ];
+  }
+}
+```
+
+### 4.2 เขียน Config (Mutable)
+
+```php
+// ดึง mutable config
+$config = \Drupal::service('config.factory')->getEditable('mymodule.settings');
+
+// ตั้งค่า
+$config->set('limit', 20);
+$config->set('enabled', TRUE);
+$config->set('nested.key', 'value');
+
+// บันทึก
+$config->save();
+
+// หรือแบบ chain
+\Drupal::service('config.factory')
+  ->getEditable('mymodule.settings')
+  ->set('key', 'value')
+  ->save();
+```
+
+### 4.3 State API (Runtime state ไม่ sync กับ config management)
+
+```php
+// บันทึก state
+\Drupal::state()->set('mymodule.last_run', time());
+\Drupal::state()->set('mymodule.counter', 42);
+
+// อ่าน state
+$last_run = \Drupal::state()->get('mymodule.last_run', 0);
+
+// ลบ state
+\Drupal::state()->delete('mymodule.last_run');
+
+// Multiple values
+\Drupal::state()->setMultiple([
+  'mymodule.key1' => 'value1',
+  'mymodule.key2' => 'value2',
+]);
+$values = \Drupal::state()->getMultiple(['mymodule.key1', 'mymodule.key2']);
+```
+
+### 4.4 Default Config Files
+
+```yaml
+# config/install/mymodule.settings.yml
+# ไฟล์นี้จะถูก import เมื่อ module ถูก install ครั้งแรก
+
+limit: 10
+enabled: false
+title: 'Default Title'
+allowed_content_types:
+  - article
+  - page
+display:
+  show_image: true
+  show_date: true
+  view_mode: teaser
+```
+
+---
+
+## Workshop: Custom Block Plugin + Custom Field Formatter
+
+### เป้าหมาย
+สร้าง:
+1. **ReadingStatsBlock** - Block ที่แสดง reading statistics ของ current node
+2. **EstimatedReadTimeFormatter** - Field formatter สำหรับ body field แสดงเวลาอ่าน
+
+### ขั้นตอนที่ 1: สร้าง Module Structure
+
+```bash
+mkdir -p web/modules/custom/reading_stats/src/Plugin/{Block,Field/FieldFormatter}
+touch web/modules/custom/reading_stats/reading_stats.info.yml
+touch web/modules/custom/reading_stats/reading_stats.services.yml
+```
+
+### ขั้นตอนที่ 2: reading_stats.info.yml
+
+```yaml
+name: 'Reading Stats'
+type: module
+description: 'Provides reading statistics for articles'
+package: Custom
+core_version_requirement: ^10
+dependencies:
+  - drupal:node
+```
+
+### ขั้นตอนที่ 3: reading_stats.services.yml
+
+```yaml
+services:
+  reading_stats.calculator:
+    class: Drupal\reading_stats\ReadingCalculator
+    arguments:
+      - '@config.factory'
+```
+
+### ขั้นตอนที่ 4: ReadingCalculator Service
 
 ```php
 <?php
+// src/ReadingCalculator.php
+
+namespace Drupal\reading_stats;
+
+use Drupal\Core\Config\ConfigFactoryInterface;
+use Drupal\node\NodeInterface;
+
+class ReadingCalculator {
+
+  protected $wordsPerMinute;
+
+  public function __construct(ConfigFactoryInterface $config_factory) {
+    $config = $config_factory->get('reading_stats.settings');
+    $this->wordsPerMinute = $config->get('words_per_minute') ?? 200;
+  }
+
+  public function calculate(NodeInterface $node): array {
+    $body = '';
+    if ($node->hasField('body') && !$node->get('body')->isEmpty()) {
+      $body = $node->get('body')->value;
+    }
+    
+    $clean_text = strip_tags($body);
+    $word_count = str_word_count($clean_text);
+    $char_count = mb_strlen($clean_text);
+    $reading_seconds = round($word_count / $this->wordsPerMinute * 60);
+    $reading_minutes = max(1, ceil($reading_seconds / 60));
+    
+    // นับรูปภาพ
+    preg_match_all('/<img/i', $body, $img_matches);
+    $image_count = count($img_matches[0]);
+    
+    // นับ paragraphs
+    preg_match_all('/<p[^>]*>/i', $body, $p_matches);
+    $paragraph_count = max(1, count($p_matches[0]));
+    
+    return [
+      'word_count' => $word_count,
+      'char_count' => $char_count,
+      'reading_minutes' => $reading_minutes,
+      'reading_seconds' => $reading_seconds,
+      'image_count' => $image_count,
+      'paragraph_count' => $paragraph_count,
+    ];
+  }
+}
+```
+
+### ขั้นตอนที่ 5: ReadingStatsBlock
+
+```php
+<?php
+// src/Plugin/Block/ReadingStatsBlock.php
+
+namespace Drupal\reading_stats\Plugin\Block;
+
+use Drupal\Core\Block\BlockBase;
+use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\reading_stats\ReadingCalculator;
+use Drupal\Core\Routing\RouteMatchInterface;
+
 /**
- * File: src/Plugin/PaymentGateway/QrPayment.php
- * 
- * Custom Plugin
- */
-
-namespace Drupal\product_catalog\Plugin\PaymentGateway;
-
-use Drupal\Core\Plugin\PluginBase;
-use Drupal\product_catalog\PaymentGatewayInterface;
-
-/**
- * @PaymentGateway(
- *   id = "qr_payment",
- *   label = @Translation("QR Payment"),
- *   description = @Translation("Pay via QR Code"),
+ * @Block(
+ *   id = "reading_stats_block",
+ *   admin_label = @Translation("Reading Statistics"),
+ *   category = @Translation("Content")
  * )
  */
-class QrPayment extends PluginBase implements PaymentGatewayInterface {
+class ReadingStatsBlock extends BlockBase implements ContainerFactoryPluginInterface {
 
-    public function getLabel(): string {
-        return $this->pluginDefinition['label'];
+  protected $calculator;
+  protected $routeMatch;
+
+  public function __construct(
+    array $configuration, $plugin_id, $plugin_definition,
+    ReadingCalculator $calculator,
+    RouteMatchInterface $route_match
+  ) {
+    parent::__construct($configuration, $plugin_id, $plugin_definition);
+    $this->calculator = $calculator;
+    $this->routeMatch = $route_match;
+  }
+
+  public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
+    return new static(
+      $configuration, $plugin_id, $plugin_definition,
+      $container->get('reading_stats.calculator'),
+      $container->get('current_route_match')
+    );
+  }
+
+  public function build() {
+    $node = $this->routeMatch->getParameter('node');
+    if (!$node || $node->bundle() !== 'article') {
+      return [];
     }
 
-    public function processPayment(array $order_data): array {
-        // สร้าง QR Code
-        $qr_url = $this->generateQrCode($order_data['amount'], $order_data['order_id']);
+    $stats = $this->calculator->calculate($node);
 
-        return [
-            'success' => TRUE,
-            'qr_url'  => $qr_url,
-            'message' => 'Scan QR to pay',
-        ];
-    }
-
-    private function generateQrCode(float $amount, string $order_id): string {
-        // PromptPay QR Format
-        $promptpay_id = $this->configuration['promptpay_id'] ?? '';
-        return "https://promptpay.io/{$promptpay_id}/{$amount}";
-    }
+    return [
+      '#theme' => 'reading_stats_block',
+      '#stats' => $stats,
+      '#cache' => [
+        'tags' => ['node:' . $node->id()],
+        'contexts' => ['route'],
+      ],
+    ];
+  }
 }
 ```
 
-```php
-<?php
-/**
- * Plugin Manager
- */
+### ขั้นตอนที่ 6: Enable และทดสอบ
 
-namespace Drupal\product_catalog;
+```bash
+drush en reading_stats -y
+drush cr
 
-use Drupal\Core\Plugin\DefaultPluginManager;
-use Drupal\Core\Cache\CacheBackendInterface;
-use Drupal\Core\Extension\ModuleHandlerInterface;
-
-class PaymentGatewayManager extends DefaultPluginManager {
-
-    public function __construct(
-        \Traversable $namespaces,
-        CacheBackendInterface $cache_backend,
-        ModuleHandlerInterface $module_handler
-    ) {
-        parent::__construct(
-            'Plugin/PaymentGateway',          // Subdirectory
-            $namespaces,
-            $module_handler,
-            PaymentGatewayInterface::class,   // Interface
-            PaymentGateway::class             // Annotation Class
-        );
-
-        $this->alterInfo('payment_gateway_info');
-        $this->setCacheBackend($cache_backend, 'payment_gateway_plugins');
-    }
-}
-```
-
----
-
-## Workshop: สร้าง Complete E-commerce Module
-
-```php
-<?php
-/**
- * Cart Service - ตัวอย่างครบวงจร
- */
-
-namespace Drupal\product_catalog\Service;
-
-use Drupal\Core\Entity\EntityTypeManagerInterface;
-use Drupal\Core\Session\AccountInterface;
-use Symfony\Component\HttpFoundation\Session\SessionInterface;
-
-class CartService {
-
-    private array $cart = [];
-
-    public function __construct(
-        private readonly SessionInterface $session,
-        private readonly AccountInterface $currentUser,
-        private readonly EntityTypeManagerInterface $entityTypeManager
-    ) {
-        $this->loadCart();
-    }
-
-    private function loadCart(): void {
-        $key = 'cart_' . $this->currentUser->id();
-        $this->cart = $this->session->get($key, []);
-    }
-
-    private function saveCart(): void {
-        $key = 'cart_' . $this->currentUser->id();
-        $this->session->set($key, $this->cart);
-    }
-
-    public function addItem(int $product_id, int $quantity = 1): bool {
-        $node = $this->entityTypeManager->getStorage('node')->load($product_id);
-        if (!$node || $node->bundle() !== 'product') {
-            return FALSE;
-        }
-
-        if (isset($this->cart[$product_id])) {
-            $this->cart[$product_id]['quantity'] += $quantity;
-        } else {
-            $this->cart[$product_id] = [
-                'product_id' => $product_id,
-                'title'      => $node->getTitle(),
-                'price'      => (float) $node->get('field_price')->value,
-                'quantity'   => $quantity,
-            ];
-        }
-
-        $this->saveCart();
-        return TRUE;
-    }
-
-    public function removeItem(int $product_id): void {
-        unset($this->cart[$product_id]);
-        $this->saveCart();
-    }
-
-    public function getTotal(): float {
-        return array_sum(array_map(
-            fn($item) => $item['price'] * $item['quantity'],
-            $this->cart
-        ));
-    }
-
-    public function getItems(): array {
-        return $this->cart;
-    }
-
-    public function clear(): void {
-        $this->cart = [];
-        $this->saveCart();
-    }
-
-    public function getCount(): int {
-        return array_sum(array_column($this->cart, 'quantity'));
-    }
-}
+# เพิ่ม block ใน Block Layout
+# Admin > Structure > Block layout > Add block > Reading Statistics
 ```
 
 ---
 
 ## Quiz
 
-**คำถามที่ 1:** Dependency Injection ใน Drupal ทำงานผ่านกลไกใด?
+**ข้อ 1:** ความแตกต่างระหว่าง `\Drupal::config()` และ `\Drupal::service('config.factory')->getEditable()` คืออะไร?
+- a) ทำงานเหมือนกันทุกอย่าง
+- b) `\Drupal::config()` return immutable object (อ่านอย่างเดียว), `getEditable()` return mutable object (แก้ไขได้)
+- c) `\Drupal::config()` ช้ากว่า
+- d) `getEditable()` ใช้ได้เฉพาะในการ install module
 
-A) Global Variables  
-B) Static Methods  
-C) Service Container (Symfony)  
-D) PHP magic methods  
-
-**เฉลย: C) Drupal ใช้ Symfony Service Container inject dependencies**
-
----
-
-**คำถามที่ 2:** `shared: true` ใน services.yml หมายความว่าอะไร?
-
-A) Service นี้ใช้ได้ทุก Module  
-B) สร้าง Instance เดียวตลอด Request (Singleton pattern)  
-C) Cache ค่า Service ไว้  
-D) อนุญาตให้ Override ได้  
-
-**เฉลย: B) shared: true เป็น Default - สร้าง 1 instance ต่อ request**
+**เฉลย:** b) `\Drupal::config()` = อ่านอย่างเดียว, `getEditable()` = อ่านและเขียนได้
 
 ---
 
-**คำถามที่ 3:** `@ContentEntityType` Annotation ใช้ทำอะไร?
+**ข้อ 2:** `ContainerFactoryPluginInterface` ใน Block plugin ใช้ทำอะไร?
+- a) ทำให้ block สามารถ export เป็น config ได้
+- b) ช่วยให้ plugin สามารถรับ dependencies ผ่าน service container (Dependency Injection)
+- c) ทำให้ block ทำงานได้เร็วขึ้น
+- d) ป้องกัน circular dependencies
 
-A) Mark class เป็น Service  
-B) ลงทะเบียน Entity Type ใหม่กับ Drupal Entity System  
-C) สร้าง Database Table อัตโนมัติ  
-D) Define permissions  
-
-**เฉลย: B) Annotation บอก Drupal Entity Type Manager เกี่ยวกับ Entity นี้**
+**เฉลย:** b) ContainerFactoryPluginInterface ช่วยให้ plugin รับ services จาก DI container ผ่าน static `create()` method
 
 ---
 
-**คำถามที่ 4:** Event Subscriber ใน Drupal ต้อง implement Interface ใด?
+**ข้อ 3:** Entity Query ต่างจาก Direct SQL Query อย่างไร?
+- a) Entity Query ช้ากว่าเสมอ
+- b) Entity Query จัดการ access control และ entity cache โดยอัตโนมัติ Direct SQL ข้ามสิ่งเหล่านี้
+- c) Direct SQL ใช้ได้เฉพาะ nodes เท่านั้น
+- d) Entity Query ใช้ได้กับ taxonomy terms เท่านั้น
 
-A) `PluginInterface`  
-B) `EventSubscriberInterface`  
-C) `HookInterface`  
-D) `ServiceInterface`  
+**เฉลย:** b) Entity Query มี access checking, translation support, และ cache invalidation built-in
 
-**เฉลย: B) `Symfony\Component\EventDispatcher\EventSubscriberInterface`**
+---
+
+**ข้อ 4:** Plugin Annotation ใน Drupal คืออะไร?
+- a) Comment ธรรมดาใน PHP
+- b) PHP docblock ที่ Drupal อ่านเพื่อ register plugin metadata เช่น `@Block(id="...", label=...)`
+- c) Configuration file แยกต่างหาก
+- d) Database record ที่เก็บ plugin info
+
+**เฉลย:** b) Annotation เป็น docblock comments ที่ Drupal parse เพื่อ discover และ register plugins
+
+---
+
+**ข้อ 5:** State API ต่างจาก Config API อย่างไร?
+- a) State API เร็วกว่า Config API
+- b) State API สำหรับ runtime state ที่ไม่ควร sync ระหว่าง environments (เช่น cron timestamps), Config API สำหรับ configuration ที่ sync ได้
+- c) Config API ใช้ database, State API ใช้ file system
+- d) ทั้งสองอย่างเหมือนกัน
+
+**เฉลย:** b) State = per-environment runtime data (ไม่ export/import), Config = exportable configuration (sync ระหว่าง environments ได้)
 
 ---
 
 ## สรุป
 
-ใน Part นี้เราได้เรียนรู้:
-- Service Container และ Dependency Injection
-- การสร้าง Custom Services
-- Event Subscribers
-- Custom Entity Types
-- Plugin System
+ใน Part นี้คุณได้เรียนรู้:
+- Services และ Dependency Injection ด้วย services.yml
+- Block Plugin และ Field Formatter Plugin
+- Entity API สำหรับโหลด, อ่าน, แก้ไข, บันทึก entities
+- Entity Queries สำหรับ complex database queries
+- Config API และ State API สำหรับจัดเก็บข้อมูล configuration
 
-**ยินดีด้วย!** คุณผ่าน Part Drupal ทั้ง 5 Parts แล้ว ตอนนี้คุณมีพื้นฐาน Drupal ที่ครบครันสำหรับ Enterprise Development
-
----
-
-## สรุปภาพรวม Drupal Series
-
-| Part | หัวข้อ | สิ่งที่ได้เรียนรู้ |
-|------|--------|-------------------|
-| 076 | Installation | Composer, Drush, Settings |
-| 077 | Content | Content Types, Fields, Taxonomy, Views |
-| 078 | Theming | Twig, Libraries, Preprocess |
-| 079 | Module Basics | Routing, Controllers, Forms |
-| 080 | Services & DI | DI, Plugins, Entity API |
-
----
-
-## แหล่งเรียนรู้เพิ่มเติม
-
-- [Drupal.org Documentation](https://www.drupal.org/docs)
-- [Drupal API Reference](https://api.drupal.org)
-- [Drupalize.me](https://drupalize.me)
+**Part ถัดไป:** Part 097 - PHP Internals & Performance
